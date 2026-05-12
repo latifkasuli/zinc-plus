@@ -363,7 +363,7 @@ impl UairSignature {
     /// `binary_poly || arbitrary_poly || int` partitioning. Materialization
     /// code in CPR / mp_eval / ideal-check must respect this order;
     /// appending bit-op evals at the tail of the down slice would silently
-    /// mis-index constraints on mixed-type shift UAIRs.
+    /// misalign the constraint indices on mixed-type shift UAIRs.
     ///
     /// Insertion order of `bit_op_specs` determines the position of each
     /// bit-op virtual within its sub-slice.

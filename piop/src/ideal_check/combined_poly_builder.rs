@@ -76,7 +76,7 @@ where
             // (cf. `UairSignature::with_bit_op_specs`). Splicing bit-op
             // virtuals into the binary_poly slice keeps `down` consistent
             // with `down_layout` — appending at the tail would silently
-            // mis-index constraints on mixed-type shift UAIRs.
+            // misalign the constraint indices on mixed-type shift UAIRs.
             let mut down: Vec<DynamicPolynomialF<F>> =
                 Vec::with_capacity(uair_sig.shifts().len() + uair_sig.bit_op_specs().len());
 
