@@ -830,6 +830,75 @@ mod tests {
         );
     }
 
+    /// Tamper test: corrupt the prover's bit-op claims at `r*`.
+    ///
+    /// Swaps the prover-supplied `bit_op_evals[0]` (claimed `MLE[ShR^3(W)]`
+    /// at `r*`) with `bit_op_evals[1]` (claimed `MLE[Rot^2(W)]` at `r*`).
+    /// With high probability these two claims are distinct field elements,
+    /// so after the swap the CPR `finalize_verifier`'s reconstruction of
+    /// the constraint polynomial at `r*` no longer matches the
+    /// sumcheck's `expected_evaluation`. The protocol must reject with
+    /// `ClaimValueDoesNotMatch` — confirming that bit-op evals on the wire
+    /// are *not* trusted standalone proof elements.
+    #[test]
+    fn test_e2e_bit_op_virtuals_tamper_bit_op_evals() {
+        let num_vars = 8;
+        do_test::<TestZincTypesIprs, TestUairBitOps<ZtInt>>(
+            num_vars,
+            (
+                make_iprs(num_vars),
+                make_iprs(num_vars),
+                make_iprs(num_vars),
+            ),
+            |_ideal, _field_cfg| IdealOrZero::<DegreeOneIdeal<F>>::zero(),
+            |proof| proof.resolver.bit_op_evals.swap(0, 1),
+            |res| {
+                assert!(matches!(
+                    res.unwrap_err(),
+                    ProtocolError::Resolver(
+                        CombinedPolyResolverError::ClaimValueDoesNotMatch { .. }
+                    )
+                ));
+            },
+        );
+    }
+
+    /// Tamper test: corrupt the source column's lifted opening.
+    ///
+    /// Overwrites `witness_lifted_evals[0].coeffs[0]` (the F-coefficient
+    /// of `bit 0` of `W` at `r_0`) with `coeffs[1]`. With high probability
+    /// the two coefficients are distinct field elements, so the verifier-
+    /// side `derive_bit_op_open_evals` (which re-applies `ShR^3` /
+    /// `Rot^2` to the *tampered* coefficient vector) yields values that
+    /// disagree with the prover's mp_eval-reduced claims. The protocol
+    /// must reject with `MultipointEvalError::ClaimMismatch` — confirming
+    /// that bit-op `open_evals` are bound to the source's lifted opening
+    /// via Lemma 2.3, not opened independently.
+    #[test]
+    fn test_e2e_bit_op_virtuals_tamper_lifted_source() {
+        let num_vars = 8;
+        do_test::<TestZincTypesIprs, TestUairBitOps<ZtInt>>(
+            num_vars,
+            (
+                make_iprs(num_vars),
+                make_iprs(num_vars),
+                make_iprs(num_vars),
+            ),
+            |_ideal, _field_cfg| IdealOrZero::<DegreeOneIdeal<F>>::zero(),
+            |proof| {
+                let w = &mut proof.witness_lifted_evals[0];
+                assert!(w.coeffs.len() >= 2, "W's lifted opening must have ≥ 2 coefficients");
+                w.coeffs[0] = w.coeffs[1].clone();
+            },
+            |res| {
+                assert!(matches!(
+                    res.unwrap_err(),
+                    ProtocolError::MultipointEval(MultipointEvalError::ClaimMismatch { .. })
+                ));
+            },
+        );
+    }
+
     /// End-to-end test: [`BinaryDecompositionUair`].
     ///
     /// Uses binary_poly (1 col) and int (1 col) trace types.
