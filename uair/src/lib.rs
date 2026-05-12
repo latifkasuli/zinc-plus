@@ -76,6 +76,71 @@ impl ShiftSpec {
 }
 
 // ---------------------------------------------------------------------------
+// BitOp virtual columns
+// ---------------------------------------------------------------------------
+
+/// An entry-wise R-linear endomorphism of the bit-polynomial cell ring
+/// `F_2[X]/(X^W)` that defines a virtual column.
+///
+/// Per Lemma 2.3 of the Zinc+ paper, any R-linear coordinate-wise map on the
+/// cell ring commutes with multilinear extension over the row hypercube.
+/// Consequently the column `T(v)` need not be committed: the prover materializes
+/// it during the constraint-aggregation sumcheck, and the verifier reconstructs
+/// its MLE evaluation at the final point `r_0` by applying `T` to the source
+/// column's lifted opening — its 32 `F_q`-coefficients — directly.
+///
+/// Bit-ops are defined only on binary_poly source columns.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum BitOp {
+    /// Right-rotation by `c` bit positions: maps `X^i` to `X^{(i + W - c) mod W}`
+    /// where `W` is the cell width.
+    Rot(usize),
+    /// Right-shift by `c` bit positions: maps `X^i` to `X^{i - c}` when
+    /// `i >= c`, otherwise to zero.
+    ShR(usize),
+}
+
+impl BitOp {
+    /// The rotation / shift count.
+    pub fn count(&self) -> usize {
+        match self {
+            BitOp::Rot(c) | BitOp::ShR(c) => *c,
+        }
+    }
+}
+
+/// Specifies a bit-op virtual column.
+///
+/// `BitOpSpec { source_col: 0, op: BitOp::ShR(3) }` declares a virtual column
+/// whose row `i` is `ShR^3` applied entry-wise to the `i`-th cell of column 0.
+///
+/// `source_col` must reference a binary_poly column; bit-ops are only defined
+/// on the cell ring `F_2[X]/(X^W)`.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct BitOpSpec {
+    /// Flat index of the binary_poly source column. Uses the same
+    /// `binary_poly || arbitrary_poly || int` indexing as `ShiftSpec`.
+    source_col: usize,
+    /// The bit-op applied entry-wise to the source column.
+    op: BitOp,
+}
+
+impl BitOpSpec {
+    pub fn new(source_col: usize, op: BitOp) -> Self {
+        assert!(op.count() > 0, "bit-op count must be non-zero");
+        Self { source_col, op }
+    }
+
+    pub fn source_col(&self) -> usize {
+        self.source_col
+    }
+
+    pub fn op(&self) -> BitOp {
+        self.op
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Column layout types
 // ---------------------------------------------------------------------------
 
@@ -182,7 +247,11 @@ pub struct UairSignature {
     witness_cols: WitnessColumnLayout,
     /// Shifted columns info sorted by `source_col`.
     shifts: Vec<ShiftSpec>,
-    /// Column-type layout of the shifted (down) row.
+    /// Bit-op virtual column specs, in insertion order. Each spec references a
+    /// binary_poly source column and contributes one extra entry to the
+    /// binary_poly slice of the down row, appended after the shifted entries.
+    bit_op_specs: Vec<BitOpSpec>,
+    /// Column-type layout of the down row (shifted virtuals + bit-op virtuals).
     down_cols: VirtualColumnLayout,
     /// Lookup specifications: which trace columns are constrained against
     /// which table types.
@@ -228,7 +297,7 @@ impl UairSignature {
         }
 
         shifts.sort_by_key(|spec| spec.source_col());
-        let down_cols = Self::compute_down_layout(&total_cols, &shifts);
+        let down_cols = Self::compute_down_layout(&total_cols, &shifts, &[]);
         let witness_cols = WitnessColumnLayout::new(
             sub!(
                 total_cols.num_binary_poly_cols(),
@@ -245,10 +314,35 @@ impl UairSignature {
             total_cols,
             public_cols,
             shifts,
+            bit_op_specs: Vec::new(),
             down_cols,
             witness_cols,
             lookup_specs,
         }
+    }
+
+    /// Attach bit-op virtual column specs to the signature.
+    ///
+    /// Each spec must reference a binary_poly source column; bit-ops are only
+    /// defined on the bit-polynomial cell ring. Insertion order determines the
+    /// position of each bit-op virtual in the binary_poly slice of the down
+    /// row, appended after the shifted entries.
+    pub fn with_bit_op_specs(mut self, bit_op_specs: Vec<BitOpSpec>) -> Self {
+        let binary_poly_end = self.total_cols.num_binary_poly_cols();
+        for spec in &bit_op_specs {
+            assert!(
+                spec.source_col() < binary_poly_end,
+                "BitOpSpec source_col {} is not a binary_poly column \
+                 (binary_poly_end = {}). Bit-ops are only defined on the \
+                 cell ring F_2[X]/(X^W).",
+                spec.source_col(),
+                binary_poly_end,
+            );
+        }
+        self.bit_op_specs = bit_op_specs;
+        self.down_cols =
+            Self::compute_down_layout(&self.total_cols, &self.shifts, &self.bit_op_specs);
+        self
     }
 
     pub fn lookup_specs(&self) -> &[LookupColumnSpec] {
@@ -258,6 +352,7 @@ impl UairSignature {
     fn compute_down_layout(
         total_cols: &TotalColumnLayout,
         shifts: &[ShiftSpec],
+        bit_op_specs: &[BitOpSpec],
     ) -> VirtualColumnLayout {
         let binary_poly_end = total_cols.num_binary_poly_cols();
         let arbitrary_poly_end = add!(binary_poly_end, total_cols.num_arbitrary_poly_cols());
@@ -273,6 +368,7 @@ impl UairSignature {
                 num_int = add!(num_int, 1);
             }
         }
+        num_binary_poly = add!(num_binary_poly, bit_op_specs.len());
         VirtualColumnLayout::new(num_binary_poly, num_arbitrary_poly, num_int)
     }
 
@@ -293,7 +389,14 @@ impl UairSignature {
         &self.shifts
     }
 
-    /// Column-type layout of the shifted (down) row.
+    /// Bit-op virtual column specs, in insertion order. Each spec contributes
+    /// one binary_poly entry to the down row, appended after the shifted
+    /// entries.
+    pub fn bit_op_specs(&self) -> &[BitOpSpec] {
+        &self.bit_op_specs
+    }
+
+    /// Column-type layout of the down row (shifted virtuals + bit-op virtuals).
     pub fn down_cols(&self) -> &VirtualColumnLayout {
         &self.down_cols
     }
