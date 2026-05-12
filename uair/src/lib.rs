@@ -389,8 +389,12 @@ impl UairSignature {
                 cell_width,
             );
         }
+        self.binary_poly_cell_width = if bit_op_specs.is_empty() {
+            None
+        } else {
+            Some(cell_width)
+        };
         self.bit_op_specs = bit_op_specs;
-        self.binary_poly_cell_width = Some(cell_width);
         self.down_cols =
             Self::compute_down_layout(&self.total_cols, &self.shifts, &self.bit_op_specs);
         self
