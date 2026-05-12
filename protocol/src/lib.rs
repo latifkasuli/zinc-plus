@@ -460,8 +460,8 @@ mod tests {
     use zinc_primality::MillerRabin;
     use zinc_test_uair::{
         BigLinearUair, BigLinearUairWithPublicInput, BinaryDecompositionUair, GenerateRandomTrace,
-        ShaProxy, TestUairBitOps, TestUairMixedShifts, TestUairNoMultiplication,
-        TestUairSimpleMultiplication,
+        ShaProxy, TestUairBitOps, TestUairBitOpsMixedSplice, TestUairMixedShifts,
+        TestUairNoMultiplication, TestUairSimpleMultiplication,
     };
     use zinc_uair::{ideal::DegreeOneIdeal, ideal_collector::IdealOrZero};
     use zinc_utils::{
@@ -830,16 +830,16 @@ mod tests {
         );
     }
 
-    /// Tamper test: corrupt the prover's bit-op claims at `r*`.
+    /// Tamper test: corrupt the prover's bit-op claim at `r*`.
     ///
-    /// Swaps the prover-supplied `bit_op_evals[0]` (claimed `MLE[ShR^3(W)]`
-    /// at `r*`) with `bit_op_evals[1]` (claimed `MLE[Rot^2(W)]` at `r*`).
-    /// With high probability these two claims are distinct field elements,
-    /// so after the swap the CPR `finalize_verifier`'s reconstruction of
-    /// the constraint polynomial at `r*` no longer matches the
-    /// sumcheck's `expected_evaluation`. The protocol must reject with
-    /// `ClaimValueDoesNotMatch` — confirming that bit-op evals on the wire
-    /// are *not* trusted standalone proof elements.
+    /// Adds `F::ONE` to `bit_op_evals[0]` (the prover's claimed
+    /// `MLE[ShR^3(W)]` at `r*`). The mutation is deterministic — the new
+    /// value differs from the original by exactly `1` regardless of the
+    /// random transcript draws. The CPR `finalize_verifier`'s
+    /// reconstruction of the constraint polynomial at `r*` no longer
+    /// matches the sumcheck's `expected_evaluation`. The protocol must
+    /// reject with `ClaimValueDoesNotMatch` — confirming that bit-op
+    /// evals on the wire are *not* trusted standalone proof elements.
     #[test]
     fn test_e2e_bit_op_virtuals_tamper_bit_op_evals() {
         let num_vars = 8;
@@ -851,7 +851,16 @@ mod tests {
                 make_iprs(num_vars),
             ),
             |_ideal, _field_cfg| IdealOrZero::<DegreeOneIdeal<F>>::zero(),
-            |proof| proof.resolver.bit_op_evals.swap(0, 1),
+            |proof| {
+                // Deterministic mutation: add `1` (in F's config recovered
+                // from the existing element, since `MontyField` is not
+                // `ConstOne` and there's no F::ONE in scope). The new value
+                // differs from the original by exactly 1 regardless of the
+                // random transcript draws, so the verifier's r* claim check
+                // *always* fails — no chance of a silent no-op.
+                let cfg = *proof.resolver.bit_op_evals[0].cfg();
+                proof.resolver.bit_op_evals[0] += F::one_with_cfg(&cfg);
+            },
             |res| {
                 assert!(matches!(
                     res.unwrap_err(),
@@ -863,17 +872,47 @@ mod tests {
         );
     }
 
+    /// End-to-end test: [`TestUairBitOpsMixedSplice`].
+    ///
+    /// Regression guard for the canonical down-row ordering
+    /// `[shifted_binary, bit_op_binary, shifted_arbitrary, shifted_int]`.
+    /// The UAIR declares a binary-source row-shift, a bit-op virtual on
+    /// the same binary source, and a non-binary (arbitrary_poly) row-
+    /// shift simultaneously — so the binary slot of the down row holds
+    /// `[W[i+1], ShR^3(W[i])]` (in that order) and the arbitrary slot
+    /// holds `[A[i+1]]`. A splicing bug that, for instance, appended
+    /// bit-op evals at the tail of the down vector would silently
+    /// misalign the constraint indices and this test would fail. The honest
+    /// trace places `W[i+1]` and `ShR^3(W[i])` in committed expected
+    /// columns; the constraints pin the virtuals to those columns and
+    /// must hold on every non-last row.
+    #[test]
+    fn test_e2e_bit_op_virtuals_mixed_splice() {
+        let num_vars = 8;
+        do_test::<TestZincTypesIprs, TestUairBitOpsMixedSplice<ZtInt>>(
+            num_vars,
+            (
+                make_iprs(num_vars),
+                make_iprs(num_vars),
+                make_iprs(num_vars),
+            ),
+            |_ideal, _field_cfg| IdealOrZero::<DegreeOneIdeal<F>>::zero(),
+            |_| {},
+            |res| res.unwrap(),
+        );
+    }
+
     /// Tamper test: corrupt the source column's lifted opening.
     ///
-    /// Overwrites `witness_lifted_evals[0].coeffs[0]` (the F-coefficient
-    /// of `bit 0` of `W` at `r_0`) with `coeffs[1]`. With high probability
-    /// the two coefficients are distinct field elements, so the verifier-
-    /// side `derive_bit_op_open_evals` (which re-applies `ShR^3` /
-    /// `Rot^2` to the *tampered* coefficient vector) yields values that
-    /// disagree with the prover's mp_eval-reduced claims. The protocol
-    /// must reject with `MultipointEvalError::ClaimMismatch` — confirming
-    /// that bit-op `open_evals` are bound to the source's lifted opening
-    /// via Lemma 2.3, not opened independently.
+    /// Adds `F::ONE` to `witness_lifted_evals[0].coeffs[0]` (the
+    /// F-coefficient of `bit 0` of `W` at `r_0`). The mutation is
+    /// deterministic. The verifier-side `derive_bit_op_open_evals`
+    /// re-applies `ShR^3` / `Rot^2` to the *tampered* coefficient
+    /// vector and yields values that disagree with the prover's
+    /// mp_eval-reduced claims. The protocol must reject with
+    /// `MultipointEvalError::ClaimMismatch` — confirming that bit-op
+    /// `open_evals` are bound to the source's lifted opening via
+    /// Lemma 2.3, not opened independently.
     #[test]
     fn test_e2e_bit_op_virtuals_tamper_lifted_source() {
         let num_vars = 8;
@@ -888,10 +927,11 @@ mod tests {
             |proof| {
                 let w = &mut proof.witness_lifted_evals[0];
                 assert!(
-                    w.coeffs.len() >= 2,
-                    "W's lifted opening must have ≥ 2 coefficients"
+                    !w.coeffs.is_empty(),
+                    "W's lifted opening must have ≥ 1 coefficient"
                 );
-                w.coeffs[0] = w.coeffs[1].clone();
+                let cfg = *w.coeffs[0].cfg();
+                w.coeffs[0] += F::one_with_cfg(&cfg);
             },
             |res| {
                 assert!(matches!(

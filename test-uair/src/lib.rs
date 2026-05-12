@@ -960,6 +960,147 @@ where
     }
 }
 
+/// Mixed-splice UAIR: exercises the canonical down-row ordering
+///
+/// ```text
+/// [shifted_binary..., bit_op_binary..., shifted_arbitrary..., shifted_int...]
+/// ```
+///
+/// when more than one of those slots is populated at once. This is the
+/// regression guard that flushed out P1 in code review: a UAIR with bit-op
+/// virtuals *and* a binary-source row-shift *and* a non-binary row-shift
+/// would have silently misaligned constraint indices if the ideal-check builder
+/// (or any other materialization site) appended bit-op evals at the tail
+/// of the down vector.
+///
+/// Trace shape:
+///   `bp[0] = W`        — random binary_poly, with row-shift by 1
+///   `bp[1] = S_shr`    — committed expected `ShR^3(W)` (no shift, no bit-op)
+///   `bp[2] = T`        — committed expected `W[i+1]` (no shift; matches the
+///                        shifted-binary virtual at row i)
+///   `arb[0] = A`       — random arbitrary_poly, with row-shift by 1
+///   `arb[1] = A_next`  — committed expected `A[i+1]`
+///
+/// Specs:
+///   shifts:        bp[0] by 1,  arb[0] by 1
+///   bit_op_specs:  `ShR(3)` on bp[0]
+///
+/// Resulting down layout (from `UairSignature::compute_down_layout`):
+///   `down.binary_poly[0] = W[i+1]`        (shifted-binary, src bp[0])
+///   `down.binary_poly[1] = ShR^3(W[i])`   (bit-op-binary)
+///   `down.arbitrary_poly[0] = A[i+1]`     (shifted-arbitrary, src arb[0])
+///
+/// Constraints (all pure equality; no ideal):
+///   `down.binary_poly[0] - up.binary_poly[2] == 0`     (W[i+1] == T)
+///   `down.binary_poly[1] - up.binary_poly[1] == 0`     (ShR^3(W) == S_shr)
+///   `down.arbitrary_poly[0] - up.arbitrary_poly[1] == 0` (A[i+1] == A_next)
+///
+/// If the splicing got the order wrong — e.g. bit-op went first in the
+/// binary slot — `down.binary_poly[0]` would carry `ShR^3(W)` instead of
+/// `W[i+1]`, and the first two constraints would fail on every row.
+#[derive(Clone, Debug)]
+pub struct TestUairBitOpsMixedSplice<R>(PhantomData<R>);
+
+impl<R> Uair for TestUairBitOpsMixedSplice<R>
+where
+    R: Semiring + 'static,
+{
+    type Ideal = ImpossibleIdeal;
+    type Scalar = DensePolynomial<R, 32>;
+
+    fn signature() -> UairSignature {
+        // 3 binary_poly columns + 2 arbitrary_poly columns.
+        let total = TotalColumnLayout::new(3, 2, 0);
+        // Row-shift on bp[0] (binary source) and arb[0] (non-binary source).
+        let shifts = vec![ShiftSpec::new(0, 1), ShiftSpec::new(3, 1)];
+        let bit_op_specs = vec![BitOpSpec::new(0, BitOp::ShR(3))];
+        UairSignature::new(total, PublicColumnLayout::default(), shifts, vec![])
+            .with_bit_op_specs(32, bit_op_specs)
+    }
+
+    fn constrain_general<B, FromR, MulByScalar, IFromR>(
+        b: &mut B,
+        up: TraceRow<B::Expr>,
+        down: TraceRow<B::Expr>,
+        _from_ref: FromR,
+        _mbs: MulByScalar,
+        _ideal_from_ref: IFromR,
+    ) where
+        B: ConstraintBuilder,
+    {
+        // The shifted-binary slot must come before the bit-op-binary slot
+        // inside `down.binary_poly` — these two constraints together pin
+        // that ordering. The third constraint exercises the
+        // shifted_arbitrary slot, which sits *after* the bit-op-binary
+        // count in the flat down vector.
+        b.assert_zero(down.binary_poly[0].clone() - &up.binary_poly[2]);
+        b.assert_zero(down.binary_poly[1].clone() - &up.binary_poly[1]);
+        b.assert_zero(down.arbitrary_poly[0].clone() - &up.arbitrary_poly[1]);
+    }
+}
+
+impl<R> GenerateRandomTrace<32> for TestUairBitOpsMixedSplice<R>
+where
+    R: FixedSemiring + From<i8> + 'static,
+    StandardUniform: Distribution<R>,
+{
+    type PolyCoeff = R;
+    type Int = R;
+
+    fn generate_random_trace<Rng: RngCore + ?Sized>(
+        num_vars: usize,
+        rng: &mut Rng,
+    ) -> UairTrace<'static, R, R, 32> {
+        let n = 1usize << num_vars;
+
+        // Binary columns.
+        let w_u32: Vec<u32> = (0..n).map(|_| rng.next_u32()).collect();
+        let w_col: DenseMultilinearExtension<BinaryPoly<32>> =
+            w_u32.iter().map(|w| BinaryPoly::from(*w)).collect();
+        let s_shr_col: DenseMultilinearExtension<BinaryPoly<32>> =
+            w_u32.iter().map(|w| BinaryPoly::from(w >> 3)).collect();
+        // T[i] = W[i+1] for i < n-1, T[n-1] = 0 (zero-padded to match the
+        // shift virtual's last-row behaviour; the protocol's (1-selector)
+        // factor would mask any divergence at the last row anyway).
+        let t_col: DenseMultilinearExtension<BinaryPoly<32>> = (0..n)
+            .map(|i| {
+                if i + 1 < n {
+                    BinaryPoly::from(w_u32[i + 1])
+                } else {
+                    BinaryPoly::from(0u32)
+                }
+            })
+            .collect();
+
+        // Arbitrary-poly columns: constant cells (degree-0 polynomials),
+        // following the `TestUairMixedShifts` convention. Constant cells
+        // keep the trace within the degree-32 bound trivially.
+        let a_cells: Vec<DensePolynomial<R, 32>> = (0..n)
+            .map(|_| DensePolynomial::new([R::from(rng.random::<i8>())]))
+            .collect();
+        let a_next_cells: Vec<DensePolynomial<R, 32>> = (0..n)
+            .map(|i| {
+                if i + 1 < n {
+                    a_cells[i + 1].clone()
+                } else {
+                    DensePolynomial::<R, 32>::zero()
+                }
+            })
+            .collect();
+
+        let a_col: DenseMultilinearExtension<DensePolynomial<R, 32>> =
+            a_cells.into_iter().collect();
+        let a_next_col: DenseMultilinearExtension<DensePolynomial<R, 32>> =
+            a_next_cells.into_iter().collect();
+
+        UairTrace {
+            binary_poly: vec![w_col, s_shr_col, t_col].into(),
+            arbitrary_poly: vec![a_col, a_next_col].into(),
+            int: vec![].into(),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use crypto_primitives::crypto_bigint_int::Int;
