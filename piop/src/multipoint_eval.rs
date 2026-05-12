@@ -46,7 +46,7 @@ use zinc_transcript::{
     delegate_transcribable,
     traits::{ConstTranscribable, Transcript},
 };
-use zinc_uair::ShiftSpec;
+use zinc_uair::{BitOpSpec, ShiftSpec};
 use zinc_utils::{cfg_into_iter, inner_transparent_field::InnerTransparentField};
 
 //
@@ -89,6 +89,13 @@ pub struct Subclaim<F: PrimeField> {
     pub gammas: Vec<F>,
     /// Per-shift batching coefficients \alpha_k sampled during the protocol.
     pub alphas: Vec<F>,
+    /// Per-bit-op batching coefficients \gamma_ℓ^{bit} sampled during the
+    /// protocol, in `bit_op_specs` order. Bit-op virtual columns enter the
+    /// precombined MLE under their own batching coefficients (rather than
+    /// reusing `gammas`) so they remain a separate logical stream — their
+    /// open_evals at r_0 are *derived* from source lifted openings via
+    /// Lemma 2.3, not opened independently.
+    pub bit_op_gammas: Vec<F>,
     /// `eq(r_0, r')` — the equality selector at the sumcheck output point.
     pub eq_at_r0: F,
     /// Per-shift selector values at r_0:
@@ -111,30 +118,55 @@ where
     /// Multi-point evaluation protocol prover.
     ///
     /// Runs the combined sumcheck over
-    /// `eq(b, r') * \sum_j(\gamma_j * v_j(b)) + \sum_k \alpha_k *
-    /// next_{c_k}(r', b) * v_{src_k}(b)`. Returns only the sumcheck proof
-    /// and the challenge point `r_0`; the caller is responsible for
-    /// computing and sending `lifted_evals` at `r_0`.
-    #[allow(clippy::arithmetic_side_effects)]
+    /// `eq(b, r') * (\sum_j γ_j v_j(b) + \sum_ℓ γ_ℓ^bit T_ℓ(v_{j_ℓ})(b))
+    ///  + \sum_k α_k next_{c_k}(r', b) v_{src_k}(b)`. Returns only the
+    /// sumcheck proof and the challenge point `r_0`; the caller is responsible
+    /// for computing and sending `lifted_evals` at `r_0`, from which the
+    /// scalar open_evals (committed and bit-op-derived) are produced.
+    ///
+    /// `bit_op_mles` are MLEs of the bit-op virtual columns (post-projection),
+    /// in `bit_op_specs` order. `bit_op_evals` are the prover's r*-claims
+    /// for those virtual columns — already absorbed into the transcript at
+    /// the CPR finalize step.
+    #[allow(clippy::arithmetic_side_effects, clippy::too_many_arguments)]
     pub fn prove_as_subprotocol(
         transcript: &mut impl Transcript,
         trace_mles: &[DenseMultilinearExtension<F::Inner>],
+        bit_op_mles: &[DenseMultilinearExtension<F::Inner>],
         eval_point: &[F],
         up_evals: &[F],
         down_evals: &[F],
+        bit_op_evals: &[F],
         shifts: &[ShiftSpec],
+        bit_op_specs: &[BitOpSpec],
         field_cfg: &F::Config,
     ) -> Result<(Proof<F>, ProverState<F>), MultipointEvalError<F>> {
         let num_cols = trace_mles.len();
         let num_down_cols = shifts.len();
+        let num_bit_op_cols = bit_op_specs.len();
+        assert_eq!(
+            bit_op_mles.len(),
+            num_bit_op_cols,
+            "bit_op_mles count must match bit_op_specs.len()",
+        );
+        assert_eq!(
+            bit_op_evals.len(),
+            num_bit_op_cols,
+            "bit_op_evals count must match bit_op_specs.len()",
+        );
         let num_vars = eval_point.len();
         let zero = F::zero_with_cfg(field_cfg);
         let zero_inner = zero.inner();
 
-        // Step 1: Sample multi-point batching coefficient \alpha and column
-        // batching coefficients \gamma_1,...,\gamma_J.
+        // Step 1: Sample batching coefficients in a fixed transcript order:
+        //   - alphas (one per shift),
+        //   - gammas (one per committed up column),
+        //   - bit_op_gammas (one per bit-op virtual column).
+        // Empty vectors sample no challenges, so signatures without bit-ops
+        // produce a transcript identical to the pre-bit-op code path.
         let alphas: Vec<F> = transcript.get_field_challenges(num_down_cols, field_cfg);
         let gammas: Vec<F> = transcript.get_field_challenges(num_cols, field_cfg);
+        let bit_op_gammas: Vec<F> = transcript.get_field_challenges(num_bit_op_cols, field_cfg);
 
         // Step 2: Build the two selector MLEs:
         //   eq_r(b)   = eq(b, r')
@@ -151,11 +183,13 @@ where
             .into_iter()
             .unzip();
 
-        // Precombine up cols with gammas, precombined[b] = Σ_j γ_j trace[j][b]
+        // Precombine up cols with gammas plus bit-op virtuals with their own
+        // batching coefficients:
+        //   precombined[b] = Σ_j γ_j trace[j][b] + Σ_ℓ γ_ℓ^bit bit_op[ℓ][b]
         let precombined = {
             let evaluations: Vec<_> = cfg_into_iter!(0..1 << num_vars)
                 .map(|b| {
-                    gammas
+                    let mut acc = gammas
                         .iter()
                         .enumerate()
                         .fold(zero.clone(), |acc, (i, gamma)| {
@@ -164,8 +198,15 @@ where
                                 field_cfg,
                             );
                             acc + eval_f * gamma
-                        })
-                        .into_inner()
+                        });
+                    for (i, gamma) in bit_op_gammas.iter().enumerate() {
+                        let eval_f = F::new_unchecked_with_cfg(
+                            bit_op_mles[i].evaluations[b].clone(),
+                            field_cfg,
+                        );
+                        acc += eval_f * gamma;
+                    }
+                    acc.into_inner()
                 })
                 .collect();
             DenseMultilinearExtension::from_evaluations_vec(
@@ -209,7 +250,15 @@ where
         // Sanity check
         debug_assert_eq!(
             sumcheck_proof.claimed_sum,
-            compute_expected_sum(up_evals, down_evals, &gammas, &alphas, zero)
+            compute_expected_sum(
+                up_evals,
+                down_evals,
+                bit_op_evals,
+                &gammas,
+                &alphas,
+                &bit_op_gammas,
+                zero,
+            )
         );
 
         Ok((
@@ -235,22 +284,39 @@ where
         eval_point: &[F],
         up_evals: &[F],
         down_evals: &[F],
+        bit_op_evals: &[F],
         shifts: &[ShiftSpec],
+        bit_op_specs: &[BitOpSpec],
         num_vars: usize,
         field_cfg: &F::Config,
     ) -> Result<Subclaim<F>, MultipointEvalError<F>> {
         let num_cols = up_evals.len();
         let num_down_cols = shifts.len();
+        let num_bit_op_cols = bit_op_specs.len();
+        assert_eq!(
+            bit_op_evals.len(),
+            num_bit_op_cols,
+            "bit_op_evals count must match bit_op_specs.len()",
+        );
         let zero = F::zero_with_cfg(field_cfg);
         let one = F::one_with_cfg(field_cfg);
 
-        // Step 1: Sample \alpha_k and \gamma_j (must match prover).
+        // Step 1: Sample \alpha_k, \gamma_j, and \gamma_ℓ^{bit} (must match
+        // prover's order).
         let alphas: Vec<F> = transcript.get_field_challenges(num_down_cols, field_cfg);
         let gammas: Vec<F> = transcript.get_field_challenges(num_cols, field_cfg);
+        let bit_op_gammas: Vec<F> = transcript.get_field_challenges(num_bit_op_cols, field_cfg);
 
         // Step 2: Compute expected sum
-        let expected_sum: F =
-            compute_expected_sum(up_evals, down_evals, &gammas, &alphas, zero.clone());
+        let expected_sum: F = compute_expected_sum(
+            up_evals,
+            down_evals,
+            bit_op_evals,
+            &gammas,
+            &alphas,
+            &bit_op_gammas,
+            zero.clone(),
+        );
 
         if proof.sumcheck_proof.claimed_sum != expected_sum {
             return Err(MultipointEvalError::WrongSumcheckSum {
@@ -281,26 +347,35 @@ where
             sumcheck_subclaim,
             gammas,
             alphas,
+            bit_op_gammas,
             eq_at_r0,
             shifts_at_r0,
         })
     }
 
-    /// Finalize the multi-point evaluation check given `open_evals`.
+    /// Finalize the multi-point evaluation check given `open_evals` and the
+    /// verifier-derived `bit_op_open_evals`.
+    ///
+    /// `bit_op_open_evals[ℓ]` must equal `ψ_α(T_ℓ(lifted_MLE[v_{j_ℓ}](r_0)))`
+    /// — i.e. the caller has already applied the bit-op to the source
+    /// column's lifted opening and projected through ψ_α. This is the place
+    /// where Lemma 2.3 ties the bit-op virtual back to a committed source.
     ///
     /// Verifies that
-    /// `eq_at_r0 * \sum_j(gamma_j * open_eval_j) + \sum_k(alpha_k *
-    /// shift_at_r0_k * open_eval[source_col_k])` equals the sumcheck's
-    /// expected evaluation. This is a pure arithmetic check with no
+    /// `eq_at_r0 * (\sum_j γ_j open_eval_j + \sum_ℓ γ_ℓ^bit bit_op_open_eval_ℓ)
+    ///  + \sum_k α_k shift_at_r0_k open_eval[source_col_k]`
+    /// equals the sumcheck's expected evaluation. Pure arithmetic, no
     /// transcript interaction.
     #[allow(clippy::arithmetic_side_effects)]
     pub fn verify_subclaim(
         subclaim: &Subclaim<F>,
         open_evals: &[F],
+        bit_op_open_evals: &[F],
         shifts: &[ShiftSpec],
         field_cfg: &F::Config,
     ) -> Result<(), MultipointEvalError<F>> {
         let num_cols = subclaim.gammas.len();
+        let num_bit_op_cols = subclaim.bit_op_gammas.len();
 
         if open_evals.len() != num_cols {
             return Err(MultipointEvalError::WrongOpenEvalsNumber {
@@ -309,13 +384,30 @@ where
             });
         }
 
+        if bit_op_open_evals.len() != num_bit_op_cols {
+            return Err(MultipointEvalError::WrongBitOpOpenEvalsNumber {
+                got: bit_op_open_evals.len(),
+                expected: num_bit_op_cols,
+            });
+        }
+
         let zero = F::zero_with_cfg(field_cfg);
 
-        let batched_up: F = subclaim
+        let mut batched_up: F = subclaim
             .gammas
             .iter()
             .zip(open_evals.iter())
             .fold(zero.clone(), |acc, (gamma, eval)| {
+                acc + gamma.clone() * eval
+            });
+        // Bit-op virtuals are batched into the *up* side with their own
+        // coefficients: their open_evals are derived from source openings
+        // via Lemma 2.3 (rather than being independent commitments).
+        batched_up = subclaim
+            .bit_op_gammas
+            .iter()
+            .zip(bit_op_open_evals.iter())
+            .fold(batched_up, |acc, (gamma, eval)| {
                 acc + gamma.clone() * eval
             });
 
@@ -345,13 +437,17 @@ where
     }
 }
 
-/// `expected_sum = \sum_j \gamma_j * up_eval_j + \sum_k \alpha_k *
-/// down_eval_k`
+/// `expected_sum = Σ_j γ_j up_eval_j
+///                + Σ_k α_k down_eval_k
+///                + Σ_ℓ γ_ℓ^bit bit_op_eval_ℓ`
+#[allow(clippy::arithmetic_side_effects, clippy::too_many_arguments)]
 fn compute_expected_sum<F: PrimeField>(
     up_evals: &[F],
     down_evals: &[F],
+    bit_op_evals: &[F],
     gammas: &[F],
     alphas: &[F],
+    bit_op_gammas: &[F],
     zero: F,
 ) -> F {
     let up_sum = gammas
@@ -359,10 +455,17 @@ fn compute_expected_sum<F: PrimeField>(
         .zip(up_evals.iter())
         .fold(zero, |acc, (gamma, up)| acc + gamma.clone() * up);
 
-    alphas
+    let up_and_down = alphas
         .iter()
         .zip(down_evals.iter())
-        .fold(up_sum, |acc, (alpha, down)| acc + alpha.clone() * down)
+        .fold(up_sum, |acc, (alpha, down)| acc + alpha.clone() * down);
+
+    bit_op_gammas
+        .iter()
+        .zip(bit_op_evals.iter())
+        .fold(up_and_down, |acc, (gamma, eval)| {
+            acc + gamma.clone() * eval
+        })
 }
 
 //
@@ -373,6 +476,8 @@ fn compute_expected_sum<F: PrimeField>(
 pub enum MultipointEvalError<F: PrimeField> {
     #[error("wrong number of open evaluations: got {got}, expected {expected}")]
     WrongOpenEvalsNumber { got: usize, expected: usize },
+    #[error("wrong number of bit-op open evaluations: got {got}, expected {expected}")]
+    WrongBitOpOpenEvalsNumber { got: usize, expected: usize },
     #[error("wrong sumcheck claimed sum: got {got}, expected {expected}")]
     WrongSumcheckSum { got: F, expected: F },
     #[error("multi-point eval claim mismatch: got {got}, expected {expected}")]
@@ -483,10 +588,13 @@ mod tests {
         let (proof, prover_state) = MultipointEval::<F>::prove_as_subprotocol(
             &mut transcript,
             trace_mles,
+            &[],
             &public.eval_point,
             &public.up_evals,
             &public.down_evals,
+            &[],
             &public.shifts,
+            &[],
             &(),
         )
         .expect("prover should succeed");
@@ -511,12 +619,20 @@ mod tests {
             &public.eval_point,
             &public.up_evals,
             &public.down_evals,
+            &[],
             &public.shifts,
+            &[],
             public.num_vars,
             &(),
         )?;
 
-        MultipointEval::<F>::verify_subclaim(&subclaim, &msg.open_evals, &public.shifts, &())?;
+        MultipointEval::<F>::verify_subclaim(
+            &subclaim,
+            &msg.open_evals,
+            &[],
+            &public.shifts,
+            &(),
+        )?;
 
         Ok(subclaim)
     }

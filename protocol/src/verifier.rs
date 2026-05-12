@@ -17,7 +17,7 @@ use zinc_transcript::{
     traits::{ConstTranscribable, Transcript},
 };
 use zinc_uair::{
-    Uair, UairSignature, UairTrace,
+    BitOp, BitOpSpec, Uair, UairSignature, UairTrace,
     constraint_counter::count_constraints,
     ideal::{Ideal, IdealCheck},
     ideal_collector::IdealOrZero,
@@ -514,7 +514,9 @@ where
             &self.cpr_subclaim.evaluation_point,
             &self.cpr_subclaim.up_evals,
             &self.cpr_subclaim.down_evals,
+            &self.cpr_subclaim.bit_op_evals,
             self.base.uair_signature.shifts(),
+            self.base.uair_signature.bit_op_specs(),
             self.base.num_vars,
             &self.field_cfg,
         )?;
@@ -600,9 +602,25 @@ where
             .collect::<Result<Vec<_>, _>>()
             .map_err(ProtocolError::LiftedEvalProjection)?;
 
+        // Derive bit-op virtual columns' open_evals at r_0 from the source
+        // columns' lifted openings via Lemma 2.3:
+        //   MLE[ψ_α(T(v))](r_0) = ψ_α(T(lifted_MLE[v](r_0)))
+        // where T is the bit-op (Rot_c or ShR_c) acting R-linearly on
+        // R^{<D}[X] coefficients. The verifier never trusts the prover's
+        // r*-claim about a bit-op virtual on its own — `verify_subclaim`
+        // below binds it back to this derived value.
+        let bit_op_open_evals: Vec<F> = derive_bit_op_open_evals::<F, D>(
+            self.base.uair_signature.bit_op_specs(),
+            &all_lifted_evals,
+            &self.projecting_element_f,
+            &self.field_cfg,
+        )
+        .map_err(ProtocolError::LiftedEvalProjection)?;
+
         MultipointEval::verify_subclaim(
             &self.mp_subclaim,
             &open_evals,
+            &bit_op_open_evals,
             self.base.uair_signature.shifts(),
             &self.field_cfg,
         )?;
@@ -798,4 +816,50 @@ where
         .step7_pcs_verify::<U, CHECK_FOR_OVERFLOW>()?
         .finish::<F>()
     }
+}
+
+/// Derive each bit-op virtual column's `open_eval` at `r_0` from the source
+/// column's lifted opening, via Lemma 2.3 of the Zinc+ paper.
+///
+/// For each `BitOpSpec { source_col, op }`:
+///   1. Zero-extend the source's lifted opening to `D` coefficients
+///      (`D` is the bit-polynomial cell width).
+///   2. Apply `op` (Rot_c or ShR_c) as an R-linear permutation / zero-pad of
+///      coefficient positions on `R^{<D}[X]`.
+///   3. Project the resulting `D`-coefficient polynomial through `ψ_α` (i.e.
+///      evaluate at `projecting_element`).
+///
+/// `lifted_evals` is the flattened layout `[binary_poly..., arbitrary_poly...,
+/// int...]` of lifted MLE openings at `r_0`; `source_col` indexes into it.
+/// `BitOpSpec` invariants guarantee every `source_col` references a
+/// binary_poly column, so this function never touches non-binary entries.
+#[allow(clippy::arithmetic_side_effects)]
+fn derive_bit_op_open_evals<F: PrimeField, const D: usize>(
+    bit_op_specs: &[BitOpSpec],
+    lifted_evals: &[DynamicPolynomialF<F>],
+    projecting_element: &F,
+    field_cfg: &F::Config,
+) -> Result<Vec<F>, PolyEvaluationError> {
+    bit_op_specs
+        .iter()
+        .map(|spec| {
+            let src = &lifted_evals[spec.source_col()];
+            let mut coeffs: Vec<F> = src.coeffs.clone();
+            coeffs.resize(D, F::zero_with_cfg(field_cfg));
+            let transformed: Vec<F> = match spec.op() {
+                BitOp::Rot(c) => (0..D).map(|i| coeffs[(i + c) % D].clone()).collect(),
+                BitOp::ShR(c) => (0..D)
+                    .map(|i| {
+                        let j = i + c;
+                        if j < D {
+                            coeffs[j].clone()
+                        } else {
+                            F::zero_with_cfg(field_cfg)
+                        }
+                    })
+                    .collect(),
+            };
+            DynamicPolynomialF { coeffs: transformed }.evaluate_at_point(projecting_element)
+        })
+        .collect()
 }

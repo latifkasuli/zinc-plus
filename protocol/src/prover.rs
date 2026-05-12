@@ -490,13 +490,21 @@ impl_with_type_bounds!(ProverSumchecked
     pub fn step5_multipoint_eval(
         mut self,
     ) -> Result<ProverMultipointEvaled<'a, Zt, U, F, D>, ProtocolError<F, U::Ideal>> {
+        // TODO(#185): no `main` UAIR declares bit_op_specs yet, so the
+        // bit-op streams are empty. When the test-uair / SHA UAIRs gain
+        // bit_op_specs, the prover must pass the same bit_op MLEs it built
+        // for CPR plus the bit_op_evals from the CPR proof here.
+        let bit_op_mles: Vec<_> = Vec::new();
         let (mp_proof, mp_prover_state) = MultipointEval::prove_as_subprotocol(
             &mut self.base.pcs_transcript.fs_transcript,
             &self.projected_trace_f,
+            &bit_op_mles,
             &self.cpr_eval_point,
             &self.cpr_proof.up_evals,
             &self.cpr_proof.down_evals,
+            &self.cpr_proof.bit_op_evals,
             self.base.uair_signature.shifts(),
+            self.base.uair_signature.bit_op_specs(),
             &self.field_cfg,
         )?;
 
