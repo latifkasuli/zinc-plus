@@ -7,9 +7,9 @@ use zinc_piop::{
     ideal_check::IdealCheckProtocol,
     multipoint_eval::{MultipointEval, Proof as MultipointEvalProof},
     projections::{
-        ColumnMajorTrace, ProjectedTrace, RowMajorTrace, evaluate_trace_to_column_mles,
-        project_scalars, project_scalars_to_field, project_trace_coeffs_column_major,
-        project_trace_coeffs_row_major,
+        ColumnMajorTrace, ProjectedTrace, RowMajorTrace, build_bit_op_virtual_mle,
+        evaluate_trace_to_column_mles, project_scalars, project_scalars_to_field,
+        project_trace_coeffs_column_major, project_trace_coeffs_row_major,
     },
     sumcheck::multi_degree::MultiDegreeSumcheck,
 };
@@ -104,6 +104,10 @@ pub struct ProverEvalProjected<'a, Zt: ZincTypes<D>, U: Uair, F: PrimeField, con
 
     // New
     projected_trace_f: Vec<DenseMultilinearExtension<F::Inner>>,
+    /// MLEs of the bit-op virtual columns (post-projection), in
+    /// `UairSignature::bit_op_specs()` order. Built once at step3; consumed
+    /// by both step4 (CPR) and step5 (mp_eval), so step4 clones them.
+    bit_op_mles: Vec<DenseMultilinearExtension<F::Inner>>,
     projected_scalars_f: HashMap<U::Scalar, F>,
 }
 
@@ -116,6 +120,7 @@ pub struct ProverSumchecked<'a, Zt: ZincTypes<D>, U: Uair, F: PrimeField, const 
     projected_trace: ProjectedTrace<F>,
     ic_proof: IdealCheckProof<F>,
     projected_trace_f: Vec<DenseMultilinearExtension<F::Inner>>,
+    bit_op_mles: Vec<DenseMultilinearExtension<F::Inner>>,
 
     // New
     cpr_proof: CombinedPolyResolverProof<F>,
@@ -397,6 +402,25 @@ impl_with_type_bounds!(ProverIdealChecked
         let projected_trace_f =
             evaluate_trace_to_column_mles(&self.projected_trace, &projecting_element_f);
 
+        // Materialize the bit-op virtual columns' MLEs by applying each spec's
+        // bit-op (Rot_c / ShR_c) to the source column's *polynomial* cells
+        // *before* projection (Lemma 2.3 — bit-op and ψ_α do not commute on
+        // a single cell, so the op must run pre-projection).
+        let bit_op_mles: Vec<DenseMultilinearExtension<F::Inner>> = self
+            .base
+            .uair_signature
+            .bit_op_specs()
+            .iter()
+            .map(|spec| {
+                build_bit_op_virtual_mle::<F, D>(
+                    &self.projected_trace,
+                    spec,
+                    &projecting_element_f,
+                    &self.field_cfg,
+                )
+            })
+            .collect();
+
         let projected_scalars_f =
             project_scalars_to_field(self.projected_scalars_fx, &projecting_element_f)
                 .map_err(|(_s, _f, e)| ProtocolError::ScalarProjection(e))?;
@@ -408,6 +432,7 @@ impl_with_type_bounds!(ProverIdealChecked
             ic_proof: self.ic_proof,
             ic_eval_point: self.ic_eval_point,
             projected_trace_f,
+            bit_op_mles,
             projected_scalars_f,
         })
     }
@@ -425,14 +450,10 @@ impl_with_type_bounds!(ProverEvalProjected
         let num_constraints = count_constraints::<U>();
         let max_degree = count_max_degree::<U>();
 
-        // TODO(#185): once protocol-level prover materializes bit-op virtual
-        // MLEs, pass them here. For now no UAIR on `main` declares
-        // `bit_op_specs`, so passing an empty vec keeps behaviour identical.
-        let bit_op_down_mles = Vec::new();
         let (cpr_group, cpr_ancillary) = CombinedPolyResolver::prepare_sumcheck_group::<U>(
             &mut self.base.pcs_transcript.fs_transcript,
             self.projected_trace_f.clone(),
-            bit_op_down_mles,
+            self.bit_op_mles.clone(),
             &self.ic_eval_point,
             &self.projected_scalars_f,
             num_constraints,
@@ -473,6 +494,7 @@ impl_with_type_bounds!(ProverEvalProjected
             projected_trace: self.projected_trace,
             ic_proof: self.ic_proof,
             projected_trace_f: self.projected_trace_f,
+            bit_op_mles: self.bit_op_mles,
             cpr_proof,
             cpr_eval_point: cpr_prover_state.evaluation_point,
             combined_sumcheck,
@@ -490,15 +512,10 @@ impl_with_type_bounds!(ProverSumchecked
     pub fn step5_multipoint_eval(
         mut self,
     ) -> Result<ProverMultipointEvaled<'a, Zt, U, F, D>, ProtocolError<F, U::Ideal>> {
-        // TODO(#185): no `main` UAIR declares bit_op_specs yet, so the
-        // bit-op streams are empty. When the test-uair / SHA UAIRs gain
-        // bit_op_specs, the prover must pass the same bit_op MLEs it built
-        // for CPR plus the bit_op_evals from the CPR proof here.
-        let bit_op_mles: Vec<_> = Vec::new();
         let (mp_proof, mp_prover_state) = MultipointEval::prove_as_subprotocol(
             &mut self.base.pcs_transcript.fs_transcript,
             &self.projected_trace_f,
-            &bit_op_mles,
+            &self.bit_op_mles,
             &self.cpr_eval_point,
             &self.cpr_proof.up_evals,
             &self.cpr_proof.down_evals,

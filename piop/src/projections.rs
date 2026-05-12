@@ -8,7 +8,7 @@ use zinc_poly::{
     mle::DenseMultilinearExtension,
     univariate::dynamic::over_field::{DynamicPolyFInnerProduct, DynamicPolynomialF},
 };
-use zinc_uair::{Uair, UairTrace, collect_scalars::collect_scalars};
+use zinc_uair::{BitOp, BitOpSpec, Uair, UairTrace, collect_scalars::collect_scalars};
 use zinc_utils::{
     UNCHECKED, cfg_extend, cfg_into_iter, cfg_iter, cfg_iter_mut, inner_product::InnerProduct,
     powers,
@@ -309,6 +309,80 @@ pub fn evaluate_trace_to_column_mles<F: PrimeField + 'static>(
                 )
             })
             .collect(),
+    }
+}
+
+/// Build the projected MLE of a bit-op virtual column.
+///
+/// For each row, takes the source column's polynomial cell, applies the
+/// bit-op (`Rot_c` or `ShR_c`) as an `R`-linear permutation / zero-pad of
+/// the `D` coefficient positions, and evaluates the resulting polynomial at
+/// `projecting_element`. Per Lemma 2.3 of the Zinc+ paper, this produces
+/// the same scalar as projecting the un-rotated cell and then applying the
+/// bit-op at the MLE-evaluation level — but applying the bit-op pre-projection
+/// is the only viable path on a per-cell basis, since rot/shift do not in
+/// general commute with `ψ_α` on a single scalar.
+///
+/// `spec.source_col()` must reference a binary_poly column (enforced at
+/// `UairSignature::with_bit_op_specs` construction time).
+#[allow(clippy::arithmetic_side_effects)]
+pub fn build_bit_op_virtual_mle<F: PrimeField + 'static, const D: usize>(
+    trace: &ProjectedTrace<F>,
+    spec: &BitOpSpec,
+    projecting_element: &F,
+    field_cfg: &F::Config,
+) -> DenseMultilinearExtension<F::Inner> {
+    let zero = F::zero_with_cfg(field_cfg);
+    let one = F::one_with_cfg(field_cfg);
+    let projection_powers: Vec<F> = powers(projecting_element.clone(), one, D);
+
+    let evaluate_with_bit_op = |cell: &DynamicPolynomialF<F>| -> F::Inner {
+        let mut coeffs: Vec<F> = cell.coeffs.iter().cloned().collect();
+        coeffs.resize(D, zero.clone());
+        let transformed: Vec<F> = match spec.op() {
+            BitOp::Rot(c) => (0..D).map(|i| coeffs[(i + c) % D].clone()).collect(),
+            BitOp::ShR(c) => (0..D)
+                .map(|i| {
+                    let j = i + c;
+                    if j < D {
+                        coeffs[j].clone()
+                    } else {
+                        zero.clone()
+                    }
+                })
+                .collect(),
+        };
+        DynamicPolyFInnerProduct::inner_product::<UNCHECKED>(
+            &transformed,
+            &projection_powers,
+            zero.clone(),
+        )
+        .expect("inner product cannot fail here")
+        .into_inner()
+    };
+
+    match trace {
+        ProjectedTrace::RowMajor(t) => {
+            let num_rows = t.len();
+            let num_vars = num_rows.next_power_of_two().trailing_zeros() as usize;
+            let evaluations: Vec<F::Inner> = (0..num_rows)
+                .map(|row_idx| evaluate_with_bit_op(&t[row_idx][spec.source_col()]))
+                .collect();
+            DenseMultilinearExtension::from_evaluations_vec(
+                num_vars,
+                evaluations,
+                zero.inner().clone(),
+            )
+        }
+        ProjectedTrace::ColumnMajor(t) => {
+            let col_mle = &t[spec.source_col()];
+            let evaluations: Vec<F::Inner> = col_mle.iter().map(evaluate_with_bit_op).collect();
+            DenseMultilinearExtension::from_evaluations_vec(
+                col_mle.num_vars,
+                evaluations,
+                zero.inner().clone(),
+            )
+        }
     }
 }
 
