@@ -843,6 +843,13 @@ fn derive_bit_op_open_evals<F: PrimeField, const D: usize>(
     bit_op_specs
         .iter()
         .map(|spec| {
+            let c = spec.op().count();
+            assert!(
+                c > 0 && c < D,
+                "BitOp count {} out of range for cell width D = {}",
+                c,
+                D,
+            );
             let src = &lifted_evals[spec.source_col()];
             let mut coeffs: Vec<F> = src.coeffs.clone();
             coeffs.resize(D, F::zero_with_cfg(field_cfg));

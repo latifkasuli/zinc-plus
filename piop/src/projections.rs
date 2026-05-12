@@ -336,6 +336,14 @@ pub fn build_bit_op_virtual_mle<F: PrimeField + 'static, const D: usize>(
     let one = F::one_with_cfg(field_cfg);
     let projection_powers: Vec<F> = powers(projecting_element.clone(), one, D);
 
+    let c = spec.op().count();
+    assert!(
+        c > 0 && c < D,
+        "BitOp count {} out of range for cell width D = {}",
+        c,
+        D,
+    );
+
     let evaluate_with_bit_op = |cell: &DynamicPolynomialF<F>| -> F::Inner {
         let mut coeffs: Vec<F> = cell.coeffs.iter().cloned().collect();
         coeffs.resize(D, zero.clone());

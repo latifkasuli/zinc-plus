@@ -260,6 +260,12 @@ pub struct UairSignature {
     /// binary_poly source column and contributes one extra entry to the
     /// binary_poly slice of the down row, appended after the shifted entries.
     bit_op_specs: Vec<BitOpSpec>,
+    /// Cell width `W` of the bit-polynomial source columns, i.e. the degree
+    /// bound of the cell module `R^{<W}[X]` on which bit-ops act. `Some(W)`
+    /// iff the UAIR declares any `bit_op_specs`; needed at materialization
+    /// sites (CPR / mp_eval / ideal-check) to apply `Rot_c` / `ShR_c` with
+    /// the correct modulus / zero-pad bound.
+    binary_poly_cell_width: Option<usize>,
     /// Column-type layout of the down row (shifted virtuals + bit-op virtuals).
     down_cols: VirtualColumnLayout,
     /// Lookup specifications: which trace columns are constrained against
@@ -324,6 +330,7 @@ impl UairSignature {
             public_cols,
             shifts,
             bit_op_specs: Vec::new(),
+            binary_poly_cell_width: None,
             down_cols,
             witness_cols,
             lookup_specs,
@@ -332,8 +339,15 @@ impl UairSignature {
 
     /// Attach bit-op virtual column specs to the signature.
     ///
-    /// Each spec must reference a binary_poly source column; bit-ops are only
-    /// defined on bit-polynomial cells.
+    /// `cell_width` is the degree bound `W` of the bit-polynomial cell module
+    /// `R^{<W}[X]` on which bit-ops act (typically `32` for SHA-256). All
+    /// binary_poly columns must share this cell width — bit-op semantics
+    /// (`Rot_c` modulus, `ShR_c` zero-pad bound) depend on it. The same
+    /// value is recovered downstream via [`Self::binary_poly_cell_width`].
+    ///
+    /// Each spec must reference a binary_poly source column and declare a
+    /// count strictly in `(0, cell_width)`. Bit-ops are only defined on
+    /// bit-polynomial cells.
     ///
     /// # Down-row ordering invariant
     ///
@@ -347,13 +361,18 @@ impl UairSignature {
     ///
     /// This keeps `down` consistent with `ColumnLayout`'s
     /// `binary_poly || arbitrary_poly || int` partitioning. Materialization
-    /// code in CPR / mp_eval must respect this order; appending bit-op evals
-    /// at the tail of `down_evals` would silently mis-index constraints on
-    /// mixed-type shift UAIRs.
+    /// code in CPR / mp_eval / ideal-check must respect this order;
+    /// appending bit-op evals at the tail of the down slice would silently
+    /// mis-index constraints on mixed-type shift UAIRs.
     ///
     /// Insertion order of `bit_op_specs` determines the position of each
     /// bit-op virtual within its sub-slice.
-    pub fn with_bit_op_specs(mut self, bit_op_specs: Vec<BitOpSpec>) -> Self {
+    pub fn with_bit_op_specs(
+        mut self,
+        cell_width: usize,
+        bit_op_specs: Vec<BitOpSpec>,
+    ) -> Self {
+        assert!(cell_width > 0, "bit-op cell_width must be positive");
         let binary_poly_end = self.total_cols.num_binary_poly_cols();
         for spec in &bit_op_specs {
             assert!(
@@ -364,8 +383,18 @@ impl UairSignature {
                 spec.source_col(),
                 binary_poly_end,
             );
+            let c = spec.op().count();
+            assert!(
+                c > 0 && c < cell_width,
+                "BitOp count {} out of range (must satisfy 0 < c < cell_width = {}). \
+                 Out-of-range counts are not a no-op: Rot wraps modulo W and ShR \
+                 zeros every output, so silent acceptance would mask bugs.",
+                c,
+                cell_width,
+            );
         }
         self.bit_op_specs = bit_op_specs;
+        self.binary_poly_cell_width = Some(cell_width);
         self.down_cols =
             Self::compute_down_layout(&self.total_cols, &self.shifts, &self.bit_op_specs);
         self
@@ -420,6 +449,13 @@ impl UairSignature {
     /// entries.
     pub fn bit_op_specs(&self) -> &[BitOpSpec] {
         &self.bit_op_specs
+    }
+
+    /// The degree bound `W` of the bit-polynomial cell module `R^{<W}[X]`,
+    /// declared at [`Self::with_bit_op_specs`] construction time. `None`
+    /// when the signature has no bit-op specs.
+    pub fn binary_poly_cell_width(&self) -> Option<usize> {
+        self.binary_poly_cell_width
     }
 
     /// Column-type layout of the down row (shifted virtuals + bit-op virtuals).
