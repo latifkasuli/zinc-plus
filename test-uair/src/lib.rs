@@ -19,8 +19,8 @@ use zinc_poly::{
     },
 };
 use zinc_uair::{
-    ConstraintBuilder, PublicColumnLayout, ShiftSpec, TotalColumnLayout, TraceRow, Uair,
-    UairSignature, UairTrace,
+    BitOp, BitOpSpec, ConstraintBuilder, PublicColumnLayout, ShiftSpec, TotalColumnLayout,
+    TraceRow, Uair, UairSignature, UairTrace,
     ideal::{DegreeOneIdeal, ImpossibleIdeal},
 };
 use zinc_utils::from_ref::FromRef;
@@ -854,6 +854,106 @@ where
         UairTrace {
             arbitrary_poly: vec![to_mle(a_col), to_mle(b_col), to_mle(c_col)].into(),
             ..Default::default()
+        }
+    }
+}
+
+/// Minimal UAIR exercising bit-op virtual columns end-to-end.
+///
+/// Trace shape: three binary_poly columns of cell width `32`.
+///   `bp[0] = W`        — random source bit-polynomial
+///   `bp[1] = S_shr`    — committed expected `ShR^3(W)`
+///   `bp[2] = S_rot`    — committed expected `Rot^2(W)`
+///
+/// Bit-op specs declared in insertion order:
+///   1. `BitOp::ShR(3)` on `bp[0]`
+///   2. `BitOp::Rot(2)` on `bp[0]`
+///
+/// Per the down-row ordering invariant, `down.binary_poly[0]` is the
+/// `ShR^3` virtual and `down.binary_poly[1]` is the `Rot^2` virtual.
+/// Constraints pin each virtual to its committed expected column:
+///
+/// ```text
+/// down.binary_poly[0] - up.binary_poly[1]  ==  0     (ShR^3(W) == S_shr)
+/// down.binary_poly[1] - up.binary_poly[2]  ==  0     (Rot^2(W) == S_rot)
+/// ```
+///
+/// This UAIR is the protocol-level smoke test for issue #185: it
+/// exercises CPR materialization, mp_eval batching, verifier-side
+/// reconstruction via Lemma 2.3, and the down-row splicing in
+/// ideal-check, but is intentionally scoped narrower than the SHA
+/// σ_0 / σ_1 case (which lives behind the planned PR 2's affine /
+/// linear-combination virtuals).
+#[derive(Clone, Debug)]
+pub struct TestUairBitOps<R>(PhantomData<R>);
+
+impl<R> Uair for TestUairBitOps<R>
+where
+    R: Semiring + 'static,
+{
+    type Ideal = ImpossibleIdeal;
+    type Scalar = DensePolynomial<R, 32>;
+
+    fn signature() -> UairSignature {
+        let total = TotalColumnLayout::new(3, 0, 0);
+        let bit_op_specs = vec![
+            BitOpSpec::new(0, BitOp::ShR(3)),
+            BitOpSpec::new(0, BitOp::Rot(2)),
+        ];
+        UairSignature::new(total, PublicColumnLayout::default(), vec![], vec![])
+            .with_bit_op_specs(32, bit_op_specs)
+    }
+
+    fn constrain_general<B, FromR, MulByScalar, IFromR>(
+        b: &mut B,
+        up: TraceRow<B::Expr>,
+        down: TraceRow<B::Expr>,
+        _from_ref: FromR,
+        _mbs: MulByScalar,
+        _ideal_from_ref: IFromR,
+    ) where
+        B: ConstraintBuilder,
+    {
+        // `down.binary_poly` order: [ShR^3 virtual, Rot^2 virtual] — insertion
+        // order of bit_op_specs; no shifts in this UAIR so no shifted-binary
+        // entries precede them.
+        b.assert_zero(down.binary_poly[0].clone() - &up.binary_poly[1]);
+        b.assert_zero(down.binary_poly[1].clone() - &up.binary_poly[2]);
+    }
+}
+
+impl<R> GenerateRandomTrace<32> for TestUairBitOps<R>
+where
+    R: Semiring + 'static,
+    StandardUniform: Distribution<R>,
+{
+    type PolyCoeff = R;
+    type Int = R;
+
+    fn generate_random_trace<Rng: RngCore + ?Sized>(
+        num_vars: usize,
+        rng: &mut Rng,
+    ) -> UairTrace<'static, R, R, 32> {
+        let n = 1usize << num_vars;
+
+        // Random source: a `u32` bit-pattern per row (interpreted as a
+        // bit-polynomial of degree < 32 with `{0,1}` coefficients).
+        let w_u32: Vec<u32> = (0..n).map(|_| rng.next_u32()).collect();
+
+        // Expected columns: ShR^3 corresponds to a logical right shift by 3
+        // (coeff i drawn from source coeff i+3, top 3 zero-padded). Rot^2
+        // corresponds to a right rotation by 2.
+        let w_col: DenseMultilinearExtension<BinaryPoly<32>> =
+            w_u32.iter().map(|w| BinaryPoly::from(*w)).collect();
+        let s_shr_col: DenseMultilinearExtension<BinaryPoly<32>> =
+            w_u32.iter().map(|w| BinaryPoly::from(w >> 3)).collect();
+        let s_rot_col: DenseMultilinearExtension<BinaryPoly<32>> =
+            w_u32.iter().map(|w| BinaryPoly::from(w.rotate_right(2))).collect();
+
+        UairTrace {
+            binary_poly: vec![w_col, s_shr_col, s_rot_col].into(),
+            arbitrary_poly: vec![].into(),
+            int: vec![].into(),
         }
     }
 }

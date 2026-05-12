@@ -460,7 +460,8 @@ mod tests {
     use zinc_primality::MillerRabin;
     use zinc_test_uair::{
         BigLinearUair, BigLinearUairWithPublicInput, BinaryDecompositionUair, GenerateRandomTrace,
-        ShaProxy, TestUairMixedShifts, TestUairNoMultiplication, TestUairSimpleMultiplication,
+        ShaProxy, TestUairBitOps, TestUairMixedShifts, TestUairNoMultiplication,
+        TestUairSimpleMultiplication,
     };
     use zinc_uair::{ideal::DegreeOneIdeal, ideal_collector::IdealOrZero};
     use zinc_utils::{
@@ -794,6 +795,29 @@ mod tests {
     fn test_e2e_mixed_shifts() {
         let num_vars = 8;
         do_test::<TestZincTypesIprs, TestUairMixedShifts<ZtInt>>(
+            num_vars,
+            (
+                make_iprs(num_vars),
+                make_iprs(num_vars),
+                make_iprs(num_vars),
+            ),
+            |_ideal, _field_cfg| IdealOrZero::<DegreeOneIdeal<F>>::zero(),
+            |_| {},
+            |res| res.unwrap(),
+        );
+    }
+
+    /// End-to-end test: [`TestUairBitOps`].
+    ///
+    /// Exercises the bit-op virtual column path end-to-end (issue #185):
+    /// `ShR^3` and `Rot^2` on a binary_poly source column `W`, each pinned
+    /// to a committed expected column. Drives CPR materialization, mp_eval
+    /// batching with `bit_op_gammas`, and verifier-side reconstruction via
+    /// Lemma 2.3.
+    #[test]
+    fn test_e2e_bit_op_virtuals() {
+        let num_vars = 8;
+        do_test::<TestZincTypesIprs, TestUairBitOps<ZtInt>>(
             num_vars,
             (
                 make_iprs(num_vars),
