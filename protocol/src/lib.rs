@@ -297,6 +297,35 @@ pub enum ProtocolError<F: PrimeField, I: Ideal> {
 // Helper functions
 //
 
+/// Assert that the UAIR signature's declared `binary_poly_cell_width` matches
+/// the protocol-level const `D`. Bit-op materialization happens at three
+/// independent sites — the ideal-check builder reads `cell_width` from the
+/// signature, while CPR / mp_eval / verifier reconstruction use the const
+/// generic `D` directly — so a UAIR that, e.g., calls
+/// `.with_bit_op_specs(32, ..)` while the protocol is instantiated with
+/// `D = 8` would silently desynchronize them. This check makes the mismatch
+/// fail fast at protocol entry rather than later inside the prover loop.
+///
+/// No-op when the UAIR declares no `bit_op_specs`.
+pub(crate) fn assert_uair_bit_op_cell_width_matches<U: Uair, const D: usize>(
+    uair_sig: &zinc_uair::UairSignature,
+) {
+    if !uair_sig.bit_op_specs().is_empty() {
+        let declared = uair_sig.binary_poly_cell_width().expect(
+            "bit_op_specs nonempty implies binary_poly_cell_width is set \
+             (enforced by UairSignature::with_bit_op_specs)",
+        );
+        assert_eq!(
+            declared, D,
+            "UAIR declared binary_poly_cell_width = {} via with_bit_op_specs, but \
+             the protocol is instantiated with D = {}. These must agree — bit-op \
+             materialization sites use both, so a mismatch silently desynchronizes \
+             ideal-check (uses declared width) from CPR/mp_eval/verifier (use D).",
+            declared, D,
+        );
+    }
+}
+
 /// Absorb public column entries into the Fiat-Shamir transcript.
 ///
 /// Each entry is serialized via `ConstTranscribable::write_transcription_bytes`

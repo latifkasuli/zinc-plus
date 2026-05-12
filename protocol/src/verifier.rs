@@ -240,10 +240,12 @@ where
     where
         IdealOverF: Ideal,
     {
+        let uair_signature = U::signature();
+        assert_uair_bit_op_cell_width_matches::<U, D>(&uair_signature);
         let zip_proof = std::mem::take(&mut proof.zip);
         let mut base = VerifierBase {
             num_vars,
-            uair_signature: U::signature(),
+            uair_signature,
             public_trace,
             pcs_transcript: PcsVerifierTranscript {
                 fs_transcript: Blake3Transcript::default(),
