@@ -79,24 +79,32 @@ impl ShiftSpec {
 // BitOp virtual columns
 // ---------------------------------------------------------------------------
 
-/// An entry-wise R-linear endomorphism of the bit-polynomial cell ring
-/// `F_2[X]/(X^W)` that defines a virtual column.
+/// An entry-wise `R`-linear endomorphism of the bounded-degree coefficient
+/// module `R^{<W}[X]` (cf. Section 2.1.1 of the Zinc+ paper) that defines a
+/// virtual column.
 ///
-/// Per Lemma 2.3 of the Zinc+ paper, any R-linear coordinate-wise map on the
-/// cell ring commutes with multilinear extension over the row hypercube.
-/// Consequently the column `T(v)` need not be committed: the prover materializes
-/// it during the constraint-aggregation sumcheck, and the verifier reconstructs
-/// its MLE evaluation at the final point `r_0` by applying `T` to the source
-/// column's lifted opening — its 32 `F_q`-coefficients — directly.
+/// Per Lemma 2.3, any `R`-linear coordinate-wise map on `R^{<W}[X]` commutes
+/// with multilinear extension over the row hypercube. Consequently the column
+/// `T(v)` need not be committed: the prover materializes it during the
+/// constraint-aggregation sumcheck, and the verifier reconstructs its MLE
+/// evaluation at the final point `r_0` by applying `T` to the source
+/// column's lifted opening — its `W` `F_q`-coefficients — directly.
+///
+/// `Rot(c)` admits an alternative description as multiplication by `X^{W-c}`
+/// modulo `X^W - 1`, i.e. as an endomorphism of `R[X]/(X^W - 1)`. `ShR(c)` is
+/// pure zero-padding on coefficient indices and is *not* a quotient-ring
+/// operation; both, however, are `R`-linear maps on `R^{<W}[X]` and fall
+/// under the same Lemma 2.3 frame.
 ///
 /// Bit-ops are defined only on binary_poly source columns.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum BitOp {
-    /// Right-rotation by `c` bit positions: maps `X^i` to `X^{(i + W - c) mod W}`
-    /// where `W` is the cell width.
+    /// Right-rotation by `c` bit positions. The result's coefficient at
+    /// position `i` is the source's at `(i + c) mod W`, where `W` is the
+    /// cell width.
     Rot(usize),
-    /// Right-shift by `c` bit positions: maps `X^i` to `X^{i - c}` when
-    /// `i >= c`, otherwise to zero.
+    /// Right-shift by `c` bit positions. The result's coefficient at
+    /// position `i` is the source's at `i + c` if `i + c < W`, else zero.
     ShR(usize),
 }
 
@@ -115,7 +123,8 @@ impl BitOp {
 /// whose row `i` is `ShR^3` applied entry-wise to the `i`-th cell of column 0.
 ///
 /// `source_col` must reference a binary_poly column; bit-ops are only defined
-/// on the cell ring `F_2[X]/(X^W)`.
+/// on bit-polynomial cells, i.e. elements of `R^{<W}[X]` with `{0,1}`
+/// coefficients.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct BitOpSpec {
     /// Flat index of the binary_poly source column. Uses the same
@@ -324,9 +333,26 @@ impl UairSignature {
     /// Attach bit-op virtual column specs to the signature.
     ///
     /// Each spec must reference a binary_poly source column; bit-ops are only
-    /// defined on the bit-polynomial cell ring. Insertion order determines the
-    /// position of each bit-op virtual in the binary_poly slice of the down
-    /// row, appended after the shifted entries.
+    /// defined on bit-polynomial cells.
+    ///
+    /// # Down-row ordering invariant
+    ///
+    /// Bit-op virtuals slot into the `binary_poly` slice of the down
+    /// `TraceRow`, *after* the shifted-binary entries and *before* any
+    /// non-binary entries. The full ordering of the down row is:
+    ///
+    /// ```text
+    /// [shifted_binary_poly..., bit_op_binary_poly..., shifted_arbitrary_poly..., shifted_int...]
+    /// ```
+    ///
+    /// This keeps `down` consistent with `ColumnLayout`'s
+    /// `binary_poly || arbitrary_poly || int` partitioning. Materialization
+    /// code in CPR / mp_eval must respect this order; appending bit-op evals
+    /// at the tail of `down_evals` would silently mis-index constraints on
+    /// mixed-type shift UAIRs.
+    ///
+    /// Insertion order of `bit_op_specs` determines the position of each
+    /// bit-op virtual within its sub-slice.
     pub fn with_bit_op_specs(mut self, bit_op_specs: Vec<BitOpSpec>) -> Self {
         let binary_poly_end = self.total_cols.num_binary_poly_cols();
         for spec in &bit_op_specs {
