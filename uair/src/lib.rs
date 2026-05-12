@@ -367,11 +367,7 @@ impl UairSignature {
     ///
     /// Insertion order of `bit_op_specs` determines the position of each
     /// bit-op virtual within its sub-slice.
-    pub fn with_bit_op_specs(
-        mut self,
-        cell_width: usize,
-        bit_op_specs: Vec<BitOpSpec>,
-    ) -> Self {
+    pub fn with_bit_op_specs(mut self, cell_width: usize, bit_op_specs: Vec<BitOpSpec>) -> Self {
         assert!(cell_width > 0, "bit-op cell_width must be positive");
         let binary_poly_end = self.total_cols.num_binary_poly_cols();
         for spec in &bit_op_specs {

@@ -84,10 +84,13 @@ fn bench_multipoint_eval(c: &mut Criterion, num_vars: usize, num_cols: usize) {
                     MultipointEval::<F>::prove_as_subprotocol(
                         &mut t,
                         &trace_mles,
+                        &[],
                         &eval_point,
                         &up_evals,
                         &down_evals,
+                        &[],
                         &shifts,
+                        &[],
                         &field_cfg,
                     )
                     .expect("prover failed"),
@@ -104,10 +107,13 @@ fn bench_multipoint_eval(c: &mut Criterion, num_vars: usize, num_cols: usize) {
     let (proof, prover_state) = MultipointEval::<F>::prove_as_subprotocol(
         &mut prover_transcript,
         &trace_mles,
+        &[],
         &eval_point,
         &up_evals,
         &down_evals,
+        &[],
         &shifts,
+        &[],
         &field_cfg,
     )
     .expect("prover failed");
@@ -131,13 +137,21 @@ fn bench_multipoint_eval(c: &mut Criterion, num_vars: usize, num_cols: usize) {
                     &eval_point,
                     &up_evals,
                     &down_evals,
+                    &[],
                     &shifts,
+                    &[],
                     num_vars,
                     &field_cfg,
                 )
                 .expect("verifier failed");
-                MultipointEval::<F>::verify_subclaim(&subclaim, &open_evals, &shifts, &field_cfg)
-                    .expect("subclaim check failed");
+                MultipointEval::<F>::verify_subclaim(
+                    &subclaim,
+                    &open_evals,
+                    &[],
+                    &shifts,
+                    &field_cfg,
+                )
+                .expect("subclaim check failed");
             },
             BatchSize::SmallInput,
         );

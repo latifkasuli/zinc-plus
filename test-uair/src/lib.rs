@@ -947,8 +947,10 @@ where
             w_u32.iter().map(|w| BinaryPoly::from(*w)).collect();
         let s_shr_col: DenseMultilinearExtension<BinaryPoly<32>> =
             w_u32.iter().map(|w| BinaryPoly::from(w >> 3)).collect();
-        let s_rot_col: DenseMultilinearExtension<BinaryPoly<32>> =
-            w_u32.iter().map(|w| BinaryPoly::from(w.rotate_right(2))).collect();
+        let s_rot_col: DenseMultilinearExtension<BinaryPoly<32>> = w_u32
+            .iter()
+            .map(|w| BinaryPoly::from(w.rotate_right(2)))
+            .collect();
 
         UairTrace {
             binary_poly: vec![w_col, s_shr_col, s_rot_col].into(),

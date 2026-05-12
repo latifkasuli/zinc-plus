@@ -128,7 +128,8 @@ impl<F: InnerTransparentField + FromPrimitiveWithConfig + Send + Sync> CombinedP
 
         // Down-row layout (see UairSignature::with_bit_op_specs):
         //
-        //     [shifted_binary..., bit_op_binary..., shifted_arbitrary..., shifted_int...]
+        //     [shifted_binary..., bit_op_binary..., shifted_arbitrary...,
+        // shifted_int...]
         //
         // Shifts are sorted by source_col, so binary-source shifts come first.
         // We splice the bit-op MLEs in between the binary and non-binary
@@ -462,9 +463,8 @@ impl<F: InnerTransparentField + FromPrimitiveWithConfig + Send + Sync> CombinedP
             .iter()
             .take_while(|spec| spec.source_col() < binary_poly_end)
             .count();
-        let mut full_down_evals = Vec::with_capacity(
-            add!(proof.down_evals.len(), proof.bit_op_evals.len()),
-        );
+        let mut full_down_evals =
+            Vec::with_capacity(add!(proof.down_evals.len(), proof.bit_op_evals.len()));
         full_down_evals.extend_from_slice(&proof.down_evals[..bit_op_down_offset]);
         full_down_evals.extend_from_slice(&proof.bit_op_evals);
         full_down_evals.extend_from_slice(&proof.down_evals[bit_op_down_offset..]);

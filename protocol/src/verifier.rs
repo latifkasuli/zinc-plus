@@ -241,7 +241,7 @@ where
         IdealOverF: Ideal,
     {
         let uair_signature = U::signature();
-        assert_uair_bit_op_cell_width_matches::<U, D>(&uair_signature);
+        assert_uair_bit_op_cell_width_matches::<D>(&uair_signature);
         let zip_proof = std::mem::take(&mut proof.zip);
         let mut base = VerifierBase {
             num_vars,
@@ -824,8 +824,8 @@ where
 /// column's lifted opening, via Lemma 2.3 of the Zinc+ paper.
 ///
 /// For each `BitOpSpec { source_col, op }`:
-///   1. Zero-extend the source's lifted opening to `D` coefficients
-///      (`D` is the bit-polynomial cell width).
+///   1. Zero-extend the source's lifted opening to `D` coefficients (`D` is the
+///      bit-polynomial cell width).
 ///   2. Apply `op` (Rot_c or ShR_c) as an R-linear permutation / zero-pad of
 ///      coefficient positions on `R^{<D}[X]`.
 ///   3. Project the resulting `D`-coefficient polynomial through `ψ_α` (i.e.
@@ -868,7 +868,10 @@ fn derive_bit_op_open_evals<F: PrimeField, const D: usize>(
                     })
                     .collect(),
             };
-            DynamicPolynomialF { coeffs: transformed }.evaluate_at_point(projecting_element)
+            DynamicPolynomialF {
+                coeffs: transformed,
+            }
+            .evaluate_at_point(projecting_element)
         })
         .collect()
 }

@@ -77,9 +77,8 @@ where
             // virtuals into the binary_poly slice keeps `down` consistent
             // with `down_layout` — appending at the tail would silently
             // mis-index constraints on mixed-type shift UAIRs.
-            let mut down: Vec<DynamicPolynomialF<F>> = Vec::with_capacity(
-                uair_sig.shifts().len() + uair_sig.bit_op_specs().len(),
-            );
+            let mut down: Vec<DynamicPolynomialF<F>> =
+                Vec::with_capacity(uair_sig.shifts().len() + uair_sig.bit_op_specs().len());
 
             let mut shifts_iter = uair_sig.shifts().iter();
             for _ in 0..bit_op_down_offset {
@@ -408,7 +407,9 @@ fn apply_bit_op_to_poly<F: PrimeField>(
     let mut coeffs: Vec<F> = source.coeffs.clone();
     coeffs.resize(cell_width, zero.clone());
     let transformed: Vec<F> = match spec.op() {
-        BitOp::Rot(c) => (0..cell_width).map(|i| coeffs[(i + c) % cell_width].clone()).collect(),
+        BitOp::Rot(c) => (0..cell_width)
+            .map(|i| coeffs[(i + c) % cell_width].clone())
+            .collect(),
         BitOp::ShR(c) => (0..cell_width)
             .map(|i| {
                 let j = i + c;

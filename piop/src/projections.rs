@@ -345,7 +345,7 @@ pub fn build_bit_op_virtual_mle<F: PrimeField + 'static, const D: usize>(
     );
 
     let evaluate_with_bit_op = |cell: &DynamicPolynomialF<F>| -> F::Inner {
-        let mut coeffs: Vec<F> = cell.coeffs.iter().cloned().collect();
+        let mut coeffs: Vec<F> = cell.coeffs.to_vec();
         coeffs.resize(D, zero.clone());
         let transformed: Vec<F> = match spec.op() {
             BitOp::Rot(c) => (0..D).map(|i| coeffs[(i + c) % D].clone()).collect(),

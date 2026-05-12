@@ -117,12 +117,12 @@ where
 {
     /// Multi-point evaluation protocol prover.
     ///
-    /// Runs the combined sumcheck over
-    /// `eq(b, r') * (\sum_j γ_j v_j(b) + \sum_ℓ γ_ℓ^bit T_ℓ(v_{j_ℓ})(b))
-    ///  + \sum_k α_k next_{c_k}(r', b) v_{src_k}(b)`. Returns only the
-    /// sumcheck proof and the challenge point `r_0`; the caller is responsible
-    /// for computing and sending `lifted_evals` at `r_0`, from which the
-    /// scalar open_evals (committed and bit-op-derived) are produced.
+    /// Runs the combined sumcheck over the polynomial
+    /// `eq(b, r') * (Σ_j γ_j v_j(b) + Σ_ℓ γ_ℓ^bit T_ℓ(v_{j_ℓ})(b)) + Σ_k α_k
+    /// next_{c_k}(r', b) v_{src_k}(b)`. Returns only the sumcheck proof and
+    /// the challenge point `r_0`; the caller is responsible for computing
+    /// and sending `lifted_evals` at `r_0`, from which the scalar
+    /// open_evals (committed and bit-op-derived) are produced.
     ///
     /// `bit_op_mles` are MLEs of the bit-op virtual columns (post-projection),
     /// in `bit_op_specs` order. `bit_op_evals` are the prover's r*-claims
@@ -189,16 +189,17 @@ where
         let precombined = {
             let evaluations: Vec<_> = cfg_into_iter!(0..1 << num_vars)
                 .map(|b| {
-                    let mut acc = gammas
-                        .iter()
-                        .enumerate()
-                        .fold(zero.clone(), |acc, (i, gamma)| {
-                            let eval_f = F::new_unchecked_with_cfg(
-                                trace_mles[i].evaluations[b].clone(),
-                                field_cfg,
-                            );
-                            acc + eval_f * gamma
-                        });
+                    let mut acc =
+                        gammas
+                            .iter()
+                            .enumerate()
+                            .fold(zero.clone(), |acc, (i, gamma)| {
+                                let eval_f = F::new_unchecked_with_cfg(
+                                    trace_mles[i].evaluations[b].clone(),
+                                    field_cfg,
+                                );
+                                acc + eval_f * gamma
+                            });
                     for (i, gamma) in bit_op_gammas.iter().enumerate() {
                         let eval_f = F::new_unchecked_with_cfg(
                             bit_op_mles[i].evaluations[b].clone(),
@@ -362,10 +363,9 @@ where
     /// where Lemma 2.3 ties the bit-op virtual back to a committed source.
     ///
     /// Verifies that
-    /// `eq_at_r0 * (\sum_j γ_j open_eval_j + \sum_ℓ γ_ℓ^bit bit_op_open_eval_ℓ)
-    ///  + \sum_k α_k shift_at_r0_k open_eval[source_col_k]`
-    /// equals the sumcheck's expected evaluation. Pure arithmetic, no
-    /// transcript interaction.
+    /// `eq_at_r0 * (Σ_j γ_j open_eval_j + Σ_ℓ γ_ℓ^bit bit_op_open_eval_ℓ) + Σ_k
+    /// α_k shift_at_r0_k open_eval[source_col_k]` equals the sumcheck's
+    /// expected evaluation. Pure arithmetic, no transcript interaction.
     #[allow(clippy::arithmetic_side_effects)]
     pub fn verify_subclaim(
         subclaim: &Subclaim<F>,
@@ -407,9 +407,7 @@ where
             .bit_op_gammas
             .iter()
             .zip(bit_op_open_evals.iter())
-            .fold(batched_up, |acc, (gamma, eval)| {
-                acc + gamma.clone() * eval
-            });
+            .fold(batched_up, |acc, (gamma, eval)| acc + gamma.clone() * eval);
 
         // open_evals[j] = trace_col_j(r_0) for all committed (up) columns.
         // Shifted columns reuse the same opening: the shift is captured by
@@ -463,9 +461,7 @@ fn compute_expected_sum<F: PrimeField>(
     bit_op_gammas
         .iter()
         .zip(bit_op_evals.iter())
-        .fold(up_and_down, |acc, (gamma, eval)| {
-            acc + gamma.clone() * eval
-        })
+        .fold(up_and_down, |acc, (gamma, eval)| acc + gamma.clone() * eval)
 }
 
 //
@@ -626,13 +622,7 @@ mod tests {
             &(),
         )?;
 
-        MultipointEval::<F>::verify_subclaim(
-            &subclaim,
-            &msg.open_evals,
-            &[],
-            &public.shifts,
-            &(),
-        )?;
+        MultipointEval::<F>::verify_subclaim(&subclaim, &msg.open_evals, &[], &public.shifts, &())?;
 
         Ok(subclaim)
     }

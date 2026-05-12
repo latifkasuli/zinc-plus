@@ -307,7 +307,7 @@ pub enum ProtocolError<F: PrimeField, I: Ideal> {
 /// fail fast at protocol entry rather than later inside the prover loop.
 ///
 /// No-op when the UAIR declares no `bit_op_specs`.
-pub(crate) fn assert_uair_bit_op_cell_width_matches<U: Uair, const D: usize>(
+pub(crate) fn assert_uair_bit_op_cell_width_matches<const D: usize>(
     uair_sig: &zinc_uair::UairSignature,
 ) {
     if !uair_sig.bit_op_specs().is_empty() {
@@ -887,7 +887,10 @@ mod tests {
             |_ideal, _field_cfg| IdealOrZero::<DegreeOneIdeal<F>>::zero(),
             |proof| {
                 let w = &mut proof.witness_lifted_evals[0];
-                assert!(w.coeffs.len() >= 2, "W's lifted opening must have ≥ 2 coefficients");
+                assert!(
+                    w.coeffs.len() >= 2,
+                    "W's lifted opening must have ≥ 2 coefficients"
+                );
                 w.coeffs[0] = w.coeffs[1].clone();
             },
             |res| {

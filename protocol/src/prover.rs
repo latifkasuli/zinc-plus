@@ -230,7 +230,7 @@ where
         num_vars: usize,
     ) -> Result<ProverBase<'a, Zt, U, F, D>, ProtocolError<F, U::Ideal>> {
         let uair_signature = U::signature();
-        assert_uair_bit_op_cell_width_matches::<U, D>(&uair_signature);
+        assert_uair_bit_op_cell_width_matches::<D>(&uair_signature);
         let public_trace = trace.public(&uair_signature);
         let witness_trace = trace.witness(&uair_signature);
 
