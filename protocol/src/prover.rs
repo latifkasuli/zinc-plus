@@ -1683,7 +1683,7 @@ impl_with_type_bounds!(ProverPcsOpened
     /// Assemble the final proof from accumulated state, lifting every field
     /// element into its canonical integer
     pub fn finish(self) -> Result<Proof<Zt::Fmod>, ProtocolError<C::Element>> {
-        let zip_proof = self.base.pcs_transcript.stream.into_inner();
+        let zip_proof = self.base.pcs_transcript.into_proof_bytes();
         let commitments = (
             self.base.commitment_bin,
             self.base.commitment_arb,

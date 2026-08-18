@@ -55,7 +55,7 @@ pub struct PcsProverTranscript {
 
     /// Manages serialization and deserialization of proof data as a byte
     /// stream.
-    pub stream: Cursor<Vec<u8>>,
+    stream: Cursor<Vec<u8>>,
 }
 
 // TODO(alex): Review this vs Transcribable, there is some overlap that needs to
@@ -82,18 +82,23 @@ impl PcsProverTranscript {
         self.stream.get_mut().reserve(additional_capacity)
     }
 
+    /// Returns the number of proof bytes written so far.
+    #[cfg(test)]
+    pub(crate) fn proof_len(&self) -> usize {
+        self.stream.get_ref().len()
+    }
+
+    /// Consumes the transcript and returns the complete proof byte stream.
+    pub fn into_proof_bytes(self) -> Vec<u8> {
+        self.stream.into_inner()
+    }
+
     /// Transform the prover transcript into a verifier transcript by resetting
     /// the stream. Note that the commitment must be absorbed again into the
     /// verifier transcript. This would normally be done by the verifier, but
     /// this allows us more flexibility in how we use the transcript.
     pub fn into_verification_transcript(self) -> PcsVerifierTranscript {
-        let mut result = PcsVerifierTranscript {
-            fs_transcript: Blake3Transcript::default(),
-            stream: self.stream,
-        };
-        result.stream.set_position(0);
-
-        result
+        PcsVerifierTranscript::from_proof_bytes(self.into_proof_bytes())
     }
 
     common_methods!();
@@ -288,10 +293,34 @@ pub struct PcsVerifierTranscript {
 
     /// Manages serialization and deserialization of proof data as a byte
     /// stream.
-    pub stream: Cursor<Vec<u8>>,
+    stream: Cursor<Vec<u8>>,
 }
 
 impl PcsVerifierTranscript {
+    /// Creates a verifier transcript positioned at the start of a proof.
+    pub fn from_proof_bytes(proof_bytes: Vec<u8>) -> Self {
+        Self {
+            fs_transcript: Blake3Transcript::default(),
+            stream: Cursor::new(proof_bytes),
+        }
+    }
+
+    /// Returns the complete underlying proof bytes.
+    pub fn proof_bytes(&self) -> &[u8] {
+        self.stream.get_ref()
+    }
+
+    /// Returns the total number of bytes in the proof stream.
+    #[cfg(test)]
+    pub(crate) fn proof_len(&self) -> usize {
+        self.stream.get_ref().len()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn proof_bytes_mut_for_testing(&mut self) -> &mut [u8] {
+        self.stream.get_mut()
+    }
+
     common_methods!();
 
     /// Returns an error unless the whole proof stream has been consumed.

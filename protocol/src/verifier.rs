@@ -1,6 +1,5 @@
 use super::*;
 use itertools::Itertools;
-use std::io::Cursor;
 use zinc_piop::{
     combined_poly_resolver::CombinedPolyResolver,
     ideal_check::{self, IdealCheckProtocol},
@@ -484,10 +483,7 @@ where
             num_vars,
             uair_signature,
             public_trace,
-            pcs_transcript: PcsVerifierTranscript {
-                fs_transcript: Blake3Transcript::default(),
-                stream: Cursor::new(zip_proof),
-            },
+            pcs_transcript: PcsVerifierTranscript::from_proof_bytes(zip_proof),
             vp_bin,
             vp_arb,
             vp_int,

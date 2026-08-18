@@ -829,7 +829,7 @@ mod tests {
             &field_cfg,
         )
         .unwrap();
-        let actual_proof_size_bytes = transcript.stream.get_ref().len();
+        let actual_proof_size_bytes = transcript.proof_len();
         let expected_proof_size_bytes = calculate_expected_proof_size_bytes(&param, 1);
         assert_eq!(actual_proof_size_bytes, expected_proof_size_bytes);
     }

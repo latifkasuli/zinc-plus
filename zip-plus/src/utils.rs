@@ -28,7 +28,7 @@ pub fn eprint_proof_size(label: impl std::fmt::Display, proof: &impl Transcribab
     transcript
         .write(proof)
         .expect("transcribing proof should not fail");
-    let raw = transcript.stream.into_inner();
+    let raw = transcript.into_proof_bytes();
 
     eprint_bytes_size(label, &raw);
 }

@@ -446,7 +446,7 @@ mod tests {
             // The b field elements are transcribed as canonical lifted
             // integers (no length prefix, no modulus); flip a byte in the
             // first element's value.
-            proof.stream.get_mut()[0] ^= 0x01;
+            proof.proof_bytes_mut_for_testing()[0] ^= 0x01;
 
             // Sanity check that we didn't mess up the tampering
             let tampered_i0: Uint<K> = proof.clone().read_const_many(1).unwrap().remove(0);
@@ -789,12 +789,12 @@ mod tests {
 
         let mut verifier_transcript = prover_transcript.into_verification_transcript();
         assert!(
-            column_values_start + bytes_per_cw <= verifier_transcript.stream.get_ref().len(),
+            column_values_start + bytes_per_cw <= verifier_transcript.proof_len(),
             "proof too small to tamper column values"
         );
 
         let flip_at = column_values_start + bytes_per_cw / 2;
-        verifier_transcript.stream.get_mut()[flip_at] ^= 0x01;
+        verifier_transcript.proof_bytes_mut_for_testing()[flip_at] ^= 0x01;
 
         verifier_transcript.fs_transcript.absorb_bytes(&comm.root);
         let field_cfg = get_field_cfg::<Zt, Cfg>(&mut verifier_transcript.fs_transcript);
@@ -854,10 +854,10 @@ mod tests {
         verifier_transcript.fs_transcript.absorb_bytes(&comm.root);
         get_field_cfg::<Zt, Cfg>(&mut verifier_transcript.fs_transcript);
         assert!(
-            flip_at < verifier_transcript.stream.get_ref().len(),
+            flip_at < verifier_transcript.proof_len(),
             "proof too small to tamper b section"
         );
-        verifier_transcript.stream.get_mut()[flip_at] ^= 0x01;
+        verifier_transcript.proof_bytes_mut_for_testing()[flip_at] ^= 0x01;
 
         let res = TestZip::verify::<_, CHECKED>(
             &mut verifier_transcript,
@@ -1152,11 +1152,11 @@ mod tests {
 
         let mut verifier_transcript = prover_transcript.into_verification_transcript();
         assert!(
-            b_section_size + bytes_to_corrupt <= verifier_transcript.stream.get_ref().len(),
+            b_section_size + bytes_to_corrupt <= verifier_transcript.proof_len(),
             "proof too small to tamper combined_row"
         );
 
-        for b in &mut verifier_transcript.stream.get_mut()
+        for b in &mut verifier_transcript.proof_bytes_mut_for_testing()
             [b_section_size..b_section_size + bytes_to_corrupt]
         {
             *b = 0xFF;

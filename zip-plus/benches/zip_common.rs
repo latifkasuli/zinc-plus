@@ -276,7 +276,7 @@ pub fn prove<
         do_prove!(&mut t);
         CombinedProof {
             comm: commitment,
-            proof_transcript: t.stream.into_inner(),
+            proof_transcript: t.into_proof_bytes(),
         }
     };
 
@@ -366,7 +366,7 @@ pub fn verify<
 
     let combined_proof = CombinedProof {
         comm: commitment.clone(),
-        proof_transcript: transcript.stream.get_ref().clone(),
+        proof_transcript: transcript.proof_bytes().to_vec(),
     };
 
     group.bench_function(
