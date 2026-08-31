@@ -45,9 +45,10 @@
 //! Trace cells store F_p elements in `[0, p)` (so `< 2^256`). Constraint
 //! expressions evaluated by the prover are reduced mod `p` (the proving
 //! field) so wide intermediate Z values never appear in protocol
-//! arithmetic. We use `Int<5>` (320 bits, signed): four limbs hold the
-//! F_p value, and the top limb's sign bit accommodates any signed
-//! intermediates.
+//! arithmetic. We use `Int<EC_FP_INT_LIMBS>` (`Int<4>`, 256-bit signed),
+//! whose bit pattern stores one canonical 256-bit F_p representative.
+//! Constraint expressions are reduced by the proving-field machinery;
+//! trace cells do not reserve an additional sign limb.
 //!
 //! ## Out of scope
 //!
@@ -98,11 +99,33 @@ const SECP256K1_P_HALF_HEX: &str = concat!(
 pub const SECP256K1_P_HALF_UINT: CbUint<EC_FP_INT_LIMBS> =
     CbUint::from_be_hex(SECP256K1_P_HALF_HEX);
 
+const SECP256K1_G_X_HEX: &str = concat!(
+    "79BE667EF9DCBBAC",
+    "55A06295CE870B07",
+    "029BFCDB2DCE28D9",
+    "59F2815B16F81798",
+);
+const SECP256K1_G_Y_HEX: &str = concat!(
+    "483ADA7726A3C465",
+    "5DA4FBFC0E1108A8",
+    "FD17B448A6855419",
+    "9C47D08FFB10D4B8",
+);
+
+/// Canonical secp256k1 generator coordinates.
+pub const SECP256K1_G_X_UINT: CbUint<EC_FP_INT_LIMBS> =
+    CbUint::from_be_hex(SECP256K1_G_X_HEX);
+pub const SECP256K1_G_Y_UINT: CbUint<EC_FP_INT_LIMBS> =
+    CbUint::from_be_hex(SECP256K1_G_Y_HEX);
+
 /// Trait knob: a `ConstSemiring` whose representation can hold a
 /// secp256k1 base-field element. The `From<u32>` bound lets the UAIR
 /// build small constant scalars (3, 8, 9, 12) for `mul_by_scalar`.
 /// Implemented for `Int<EC_FP_INT_LIMBS>`.
-pub trait EcdsaFpRing: ConstSemiring + From<u32> + 'static {}
+pub trait EcdsaFpRing:
+    ConstSemiring + From<u32> + From<Int<EC_FP_INT_LIMBS>> + 'static
+{
+}
 
 impl EcdsaFpRing for Int<EC_FP_INT_LIMBS> {}
 

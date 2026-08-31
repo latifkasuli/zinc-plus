@@ -1,76 +1,55 @@
 //! ECDSA Shamir scalar-multiplication UAIR (F_p / EC ops — composed
 //! UAIR).
 //!
-//! Per row, computes one Shamir step `R_{t+1} = 2·R_t + addend_t`
-//! where the verifier-supplied addend is one of `{O, G, Q, G+Q}` chosen
-//! by the `(b_1[t], b_2[t])` bit pair. Implements:
+//! Per row, computes one Shamir step `R_{t+1} = 2·R_t + T_t` with the
+//! complete Renes-Costello-Batina formulas in ordinary projective coordinates.
+//! The selected addend `T_t` is one of `{O, G, Q, G+Q}` according to the
+//! public `(b_1[t], b_2[t])` bit pair.
 //!
-//! - **Row chaining**: a single chained `(W_X, W_Y, W_Z)` triple where
-//!   `up.X[t] = R_t` (the row's input) and `down.X[t] = R_{t+1}` (the
-//!   next row's input, written by this row's output-selection
-//!   constraint). No separate input/output columns.
-//! - **Init boundary**: row 0's `(X, Y, Z) = (PA_R_INIT_X, _Y, _Z)`,
-//!   the verifier-supplied starting point.
-//! - **Final boundary**: at the final row, Jacobian → affine
-//!   conversion, exposing `R_x_aff` for the verifier's
-//!   off-protocol `R_x mod n == r` check.
-//! - **Conditional add** via `S_ADD` selector: the addition formula is
-//!   inlined into the output-selection constraints — when `S_ADD = 1`,
-//!   `down.(X,Y,Z) = added`; when `S_ADD = 0`, `down.(X,Y,Z) =
-//!   doubled`.
+//! - **Row chaining**: a single chained `(W_X, W_Y, W_Z)` triple where `up.X[t]
+//!   = R_t` (the row's input) and `down.X[t] = R_{t+1}` (the next row's input).
+//!   No separate input/output columns.
+//! - **Complete boundaries**: row 0 is the projective identity `(0:1:0)`; the
+//!   same formulas handle identity, equal, and inverse additions.
+//! - **Bound addend**: two constraints bind public `(T_X,T_Y,S_ADD)` to the bit
+//!   pair and public `Q`/`G+Q`; verifier-side structure checks pin selector
+//!   shapes and canonical booleans.
+//! - **Final boundary**: the final ordinary-projective state exposes `R_x =
+//!   X/Z`; [`verify_ecdsa_result_binding`] enforces `R_x mod n == r` over exact
+//!   verifier-side integers after the proof verifier binds that public cell.
 //!
 //! ## Constraint shape
 //!
-//! 11 constraints, max degree 6. Tighter than the spec at
-//! `arithmetization_standalone/hybrid_arithmetics/ecdsa/ecdsa_intro.tex`
-//! by inlining `S = Y²` and dropping the in-circuit affine block.
+//! 20 constraints, maximum degree 5. The 13 witness columns are the chained
+//! point, six doubling products, and three diagonal addition products. The
+//! complete doubled point and the three one-use addition cross-products are
+//! inlined instead of being committed as separate columns.
+//! The 18 public columns include selector metadata, `Q`, `G+Q`, the selected
+//! addend, and boundary values.
 //!
-//! 8 EC witness columns: `(X, Y, Z, X_pa, Y_pa, Z_pa, C=H, D=R_a)`.
-//! Higher-degree intermediates `Y², Y⁴, Z_pa², Z_pa³, C², C³, X_pa·C²`
-//! are inlined into the constraint expressions. Affine readout
-//! (Z_inv, X_aff, Y_aff) is fully off-protocol — the verifier opens
-//! Z[FINAL_ROW] and computes the affine coordinates itself, or a
-//! downstream gluing UAIR enforces the binding.
+//! ## Application binding
 //!
-//! Max degree 6 attained by the inlined Y output-selection
-//! constraint's `s_active · S_ADD · D · X_pa · C²` term (matches
-//! the spec's `s_reg · R_a · X_mid · H²`). D4 also reaches degree 6
-//! via the `12·X³·Y²` term after `S` inlining.
-//!
-//! Breakdown:
-//! - 3 doubling (D2 deg 3, D3 deg 5, D4 deg 6)
-//! - 2 addition intermediates: `C` (deg 4), `D` (deg 5)
-//! - 3 output-selection-and-chaining (X: deg 5, Y: deg 6, Z: deg 4)
-//! - 3 init-boundary (deg 2)
-//!
-//! ## What's deferred
-//!
-//! - **Identity-aware initial step.** Starting from the Jacobian
-//!   identity `O = (1, 1, 0)` breaks the mixed addition formulas
-//!   (Z1=0 makes A=B=0). The verifier supplies a non-identity
-//!   `R_init`. Adding unified addition formulas to handle the
-//!   identity input is a follow-up.
-//! - **Bit columns and addend coordinates as derived publics.**
-//!   The verifier supplies both `(B_1, B_2)` bits (encoded as
-//!   `S_ADD`) and the corresponding `(PA_X_ADDEND, PA_Y_ADDEND)` per
-//!   row. No in-circuit constraint binds the addend to the bits —
-//!   that's a verifier-side check.
+//! The UAIR keeps `Q`, `G+Q`, and the scalar bits public. Application-level
+//! helpers validate and bind those values exactly before proof verification;
+//! they are not duplicated as non-native in-UAIR constraints.
 
-use core::marker::PhantomData;
+use core::{fmt, marker::PhantomData};
 
 use crypto_bigint::{NonZero, Odd, Uint as CbUint};
 use crypto_primitives::{ConstSemiring, crypto_bigint_int::Int};
 use rand::RngCore;
 use zinc_poly::{mle::DenseMultilinearExtension, univariate::dense::DensePolynomial};
 use zinc_uair::{
-    ConstraintBuilder, PublicColumnLayout, ShiftSpec, TotalColumnLayout, TraceRow, Uair,
-    UairSignature, UairTrace,
-    ideal::ImpossibleIdeal,
+    ConstraintBuilder, PublicColumnLayout, PublicStructureError, ShiftSpec, TotalColumnLayout,
+    TraceRow, Uair, UairSignature, UairTrace, ideal::ImpossibleIdeal,
 };
 
-use crate::GenerateRandomTrace;
-use crate::ecdsa_doubling::{
-    EC_FP_INT_LIMBS, EcdsaFpRing, SECP256K1_P_HALF_UINT, SECP256K1_P_UINT,
+use crate::{
+    GenerateRandomTrace,
+    ecdsa_doubling::{
+        EC_FP_INT_LIMBS, EcdsaFpRing, SECP256K1_G_X_UINT, SECP256K1_G_Y_UINT,
+        SECP256K1_P_HALF_UINT, SECP256K1_P_UINT,
+    },
 };
 
 /// Number of Shamir doubling+add rounds. With `num_vars >= 9`,
@@ -81,6 +60,223 @@ pub const NUM_SHAMIR_ROUNDS: usize = 256;
 /// The trace row at which the affine-conversion / final-output
 /// constraints apply (one past the last active doubling round).
 pub const FINAL_ROW: usize = NUM_SHAMIR_ROUNDS;
+
+const SECP256K1_N_HEX: &str = concat!(
+    "FFFFFFFFFFFFFFFF",
+    "FFFFFFFFFFFFFFFE",
+    "BAAEDCE6AF48A03B",
+    "BFD25E8CD0364141",
+);
+
+/// secp256k1 subgroup order `n` (SEC 2 section 2.4.1).
+pub const SECP256K1_N_UINT: CbUint<EC_FP_INT_LIMBS> = CbUint::from_be_hex(SECP256K1_N_HEX);
+
+/// Which of the two possible base-field representatives matched `r`.
+/// Since `p < 2n`, no other quotient is possible for a canonical `R_x`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EcdsaResultBranch {
+    /// `R_x = r`.
+    Direct,
+    /// `R_x = r + n`.
+    PlusOrder,
+}
+
+/// Verifier-side ECDSA result-binding failure.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EcdsaResultBindingError {
+    /// Compact `r` must be exactly one 32-byte big-endian integer.
+    SignatureScalarEncoding { actual_bytes: usize },
+    /// SEC 1 rejects `r = 0`.
+    SignatureScalarZero,
+    /// SEC 1 rejects `r >= n`.
+    SignatureScalarOutOfRange,
+    /// The public `PA_R_X` cell is not the unique centered encoding of an
+    /// element in `[0, p)`.
+    NonCanonicalFinalX,
+    /// The expected result cell is absent from the verifier-owned public
+    /// trace.
+    MissingPublicResult { column: usize, row: usize },
+    /// The canonical x-coordinate does not reduce to the signature scalar.
+    ResultMismatch,
+}
+
+/// One affine coordinate in the public-key statement.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EcdsaCoordinate {
+    X,
+    Y,
+}
+
+/// Verifier-side public-key validation or trace-binding failure.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EcdsaPublicKeyBindingError {
+    /// Each affine coordinate must use exactly 32 big-endian bytes.
+    CoordinateEncoding {
+        coordinate: EcdsaCoordinate,
+        actual_bytes: usize,
+    },
+    /// SEC 1 requires each coordinate to be a canonical integer below p.
+    CoordinateOutOfRange { coordinate: EcdsaCoordinate },
+    /// The canonical affine pair does not satisfy y^2 = x^3 + 7 mod p.
+    PointNotOnCurve,
+    /// Q = -G, so the affine-only statement cannot encode G+Q.
+    GeneratorSumAtInfinity,
+    /// A public Q or G+Q trace cell is absent.
+    MissingPublicPoint { column: usize, row: usize },
+    /// A public Q or G+Q trace cell is not canonically centered modulo p.
+    NonCanonicalPublicPoint { column: usize, row: usize },
+    /// A public Q or G+Q trace cell differs from the verifier-derived value.
+    PublicPointMismatch { column: usize, row: usize },
+}
+
+impl fmt::Display for EcdsaPublicKeyBindingError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::CoordinateEncoding {
+                coordinate,
+                actual_bytes,
+            } => write!(
+                formatter,
+                "public-key {coordinate:?} coordinate must be exactly 32 bytes, got {actual_bytes}",
+            ),
+            Self::CoordinateOutOfRange { coordinate } => write!(
+                formatter,
+                "public-key {coordinate:?} coordinate is not below secp256k1 p",
+            ),
+            Self::PointNotOnCurve => {
+                formatter.write_str("public key is not an affine secp256k1 point")
+            }
+            Self::GeneratorSumAtInfinity => {
+                formatter.write_str("public key equals -G, so G+Q is the point at infinity")
+            }
+            Self::MissingPublicPoint { column, row } => {
+                write!(formatter, "missing public point cell at column {column}, row {row}")
+            }
+            Self::NonCanonicalPublicPoint { column, row } => write!(
+                formatter,
+                "public point cell at column {column}, row {row} is not canonically centered modulo p",
+            ),
+            Self::PublicPointMismatch { column, row } => write!(
+                formatter,
+                "public point mismatch at column {column}, row {row}",
+            ),
+        }
+    }
+}
+
+impl std::error::Error for EcdsaPublicKeyBindingError {}
+
+/// Canonical Q and verifier-derived G+Q values accepted by the key binding.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct EcdsaBoundPublicKey {
+    pub q: (CbUint<EC_FP_INT_LIMBS>, CbUint<EC_FP_INT_LIMBS>),
+    pub g_plus_q: (CbUint<EC_FP_INT_LIMBS>, CbUint<EC_FP_INT_LIMBS>),
+}
+
+impl fmt::Display for EcdsaResultBindingError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::SignatureScalarEncoding { actual_bytes } => write!(
+                formatter,
+                "signature scalar r must be exactly 32 bytes, got {actual_bytes}",
+            ),
+            Self::SignatureScalarZero => formatter.write_str("signature scalar r is zero"),
+            Self::SignatureScalarOutOfRange => {
+                formatter.write_str("signature scalar r is not below the secp256k1 order")
+            }
+            Self::NonCanonicalFinalX => {
+                formatter.write_str("PA_R_X is not canonically centered modulo secp256k1 p")
+            }
+            Self::MissingPublicResult { column, row } => {
+                write!(formatter, "missing public ECDSA result at column {column}, row {row}")
+            }
+            Self::ResultMismatch => formatter.write_str("R_x mod n does not equal r"),
+        }
+    }
+}
+
+impl std::error::Error for EcdsaResultBindingError {}
+
+/// Decode the unique centered `Int<4>` representation of a secp256k1
+/// base-field element into its canonical integer in `[0, p)`.
+pub fn decode_canonical_final_x(
+    value: &Int<EC_FP_INT_LIMBS>,
+) -> Result<CbUint<EC_FP_INT_LIMBS>, EcdsaResultBindingError> {
+    decode_canonical_field_element(value).ok_or(EcdsaResultBindingError::NonCanonicalFinalX)
+}
+
+fn decode_canonical_field_element(
+    value: &Int<EC_FP_INT_LIMBS>,
+) -> Option<CbUint<EC_FP_INT_LIMBS>> {
+    let raw = *value.inner().as_uint();
+    let is_negative = raw.as_words()[EC_FP_INT_LIMBS - 1] >> 63 != 0;
+
+    if is_negative {
+        let decoded = raw.wrapping_add(&SECP256K1_P_UINT);
+        if decoded > SECP256K1_P_HALF_UINT && decoded < SECP256K1_P_UINT {
+            Some(decoded)
+        } else {
+            None
+        }
+    } else if raw <= SECP256K1_P_HALF_UINT {
+        Some(raw)
+    } else {
+        None
+    }
+}
+
+/// Check the SEC 1 ECDSA result equation using exact 256-bit integer
+/// arithmetic over verifier-owned public values.
+pub fn verify_ecdsa_result_binding(
+    signature_r_be: &[u8],
+    final_x: &Int<EC_FP_INT_LIMBS>,
+) -> Result<EcdsaResultBranch, EcdsaResultBindingError> {
+    if signature_r_be.len() != 32 {
+        return Err(EcdsaResultBindingError::SignatureScalarEncoding {
+            actual_bytes: signature_r_be.len(),
+        });
+    }
+
+    let signature_r = CbUint::<EC_FP_INT_LIMBS>::from_be_slice(signature_r_be);
+    if signature_r == CbUint::ZERO {
+        return Err(EcdsaResultBindingError::SignatureScalarZero);
+    }
+    if signature_r >= SECP256K1_N_UINT {
+        return Err(EcdsaResultBindingError::SignatureScalarOutOfRange);
+    }
+
+    let final_x = decode_canonical_final_x(final_x)?;
+    let (reduced, branch) = if final_x >= SECP256K1_N_UINT {
+        (
+            final_x.wrapping_sub(&SECP256K1_N_UINT),
+            EcdsaResultBranch::PlusOrder,
+        )
+    } else {
+        (final_x, EcdsaResultBranch::Direct)
+    };
+
+    if reduced == signature_r {
+        Ok(branch)
+    } else {
+        Err(EcdsaResultBindingError::ResultMismatch)
+    }
+}
+
+/// Read and verify a result cell from a verifier-owned public integer trace.
+pub fn verify_ecdsa_result_binding_in_column(
+    signature_r_be: &[u8],
+    public_int: &[DenseMultilinearExtension<Int<EC_FP_INT_LIMBS>>],
+    final_x_column: usize,
+) -> Result<EcdsaResultBranch, EcdsaResultBindingError> {
+    let final_x = public_int
+        .get(final_x_column)
+        .and_then(|column| column.evaluations.get(FINAL_ROW))
+        .ok_or(EcdsaResultBindingError::MissingPublicResult {
+            column: final_x_column,
+            row: FINAL_ROW,
+        })?;
+    verify_ecdsa_result_binding(signature_r_be, final_x)
+}
 
 // ---------------------------------------------------------------------------
 // Column layout.
@@ -106,60 +302,66 @@ pub mod cols {
     pub const PA_B1: usize = 4;
     /// Second scalar bit; see `PA_B1`.
     pub const PA_B2: usize = 5;
+    /// Verifier-checked product `PA_B1 * PA_B2`. Materializing this
+    /// public selector keeps the selected-addend constraints cubic.
+    pub const PA_B1B2: usize = 6;
     /// Affine X-coordinate of $Q$ (the public key). Constant across
     /// all rows of a single proof; consumed by the in-circuit addend
     /// formula.
-    pub const PA_QX: usize = 6;
+    pub const PA_QX: usize = 7;
     /// Affine Y-coordinate of $Q$.
-    pub const PA_QY: usize = 7;
+    pub const PA_QY: usize = 8;
     /// Affine X-coordinate of $G + Q$. Constant across all rows;
     /// consumed by the addend formula.
-    pub const PA_QGX: usize = 8;
+    pub const PA_QGX: usize = 9;
     /// Affine Y-coordinate of $G + Q$.
-    pub const PA_QGY: usize = 9;
-    /// Initial Jacobian point coordinates (boundary input at row 0).
-    pub const PA_R_INIT_X: usize = 10;
-    pub const PA_R_INIT_Y: usize = 11;
-    pub const PA_R_INIT_Z: usize = 12;
+    pub const PA_QGY: usize = 10;
+    /// Selected addend coordinates. Together with `S_ADD` these form
+    /// the ordinary-projective point `(T_X:T_Y:S_ADD)`, including the
+    /// identity `(0:1:0)` for bit pair `(0,0)`.
+    pub const PA_T_X: usize = 11;
+    pub const PA_T_Y: usize = 12;
+    /// Initial ordinary-projective point coordinates (boundary input at row 0).
+    pub const PA_R_INIT_X: usize = 13;
+    pub const PA_R_INIT_Y: usize = 14;
+    pub const PA_R_INIT_Z: usize = 15;
     /// Inverse of $P_Z[\mathrm{FINAL\_ROW}]$ in $\F_p$. Only the
     /// row-$\mathrm{FINAL\_ROW}$ cell is consumed (gated by
     /// $\col{S\_FINAL}$); all other rows can be zero.
-    pub const PA_Z_INV: usize = 13;
+    pub const PA_Z_INV: usize = 16;
     /// Affine $x$-coordinate of the loop's final point
-    /// $R = (X[\mathrm{FINAL\_ROW}], Y[\mathrm{FINAL\_ROW}], Z[\mathrm{FINAL\_ROW}])$.
-    /// Only the row-$\mathrm{FINAL\_ROW}$ cell is consumed; the verifier
-    /// is expected to check $R_x \equiv r \pmod n$ off-protocol against
-    /// the signature scalar $r$.
-    pub const PA_R_X: usize = 14;
-    pub const NUM_INT_PUB: usize = 15;
+    /// $R = (X[\mathrm{FINAL\_ROW}], Y[\mathrm{FINAL\_ROW}],
+    /// Z[\mathrm{FINAL\_ROW}])$. Only the row-$\mathrm{FINAL\_ROW}$ cell is
+    /// consumed; the verifier is expected to check $R_x \equiv r \pmod n$
+    /// off-protocol against the signature scalar $r$.
+    pub const PA_R_X: usize = 17;
+    pub const NUM_INT_PUB: usize = 18;
 
     // === Witness columns ===
 
-    // Chained Jacobian state. up.X[t] = R_t (input), down.X[t] =
+    // Chained ordinary-projective state. up.X[t] = R_t (input), down.X[t] =
     // R_{t+1} (output, written by the output-selection constraint at
     // row t).
-    pub const W_X: usize = 15;
-    pub const W_Y: usize = 16;
-    pub const W_Z: usize = 17;
+    pub const W_X: usize = 18;
+    pub const W_Y: usize = 19;
+    pub const W_Z: usize = 20;
 
-    // Doubled-point columns (X_pa/Y_pa/Z_pa). `S = Y²` is inlined into
-    // the doubling constraints — no dedicated column.
-    pub const W_X_PA: usize = 18;
-    pub const W_Y_PA: usize = 19;
-    pub const W_Z_PA: usize = 20;
+    // Six reusable products for complete RCB doubling.
+    pub const W_D_T0: usize = 21;
+    pub const W_D_T1: usize = 22;
+    pub const W_D_T2: usize = 23;
+    pub const W_D_T3: usize = 24;
+    pub const W_D_T4: usize = 25;
+    pub const W_D_T5: usize = 26;
+    // Three reusable diagonal products and one cross-product for complete RCB
+    // addition. `T3` and `T5` are inlined; retaining `T4` avoids multiplying
+    // two degree-three expressions in the final x-coordinate.
+    pub const W_A_T0: usize = 27;
+    pub const W_A_T1: usize = 28;
+    pub const W_A_T2: usize = 29;
+    pub const W_A_T4: usize = 30;
 
-    // Addition scratch: C = T_X·Z_pa² − X_pa (= H from the spec)
-    // and D = T_Y·Z_pa³ − Y_pa (= R_a from the spec), where
-    // (T_X, T_Y) is the per-row affine addend computed in-circuit
-    // from (b_1, b_2, Q, G+Q) via the addend selector. Z_pa²,
-    // Z_pa³, C², C³, X_pa·C² are inlined. The final-row affine
-    // x-readout is now in-circuit via `PA_Z_INV` and `PA_R_X`
-    // (constraints F1/F2); the order-field check
-    // $R_x \equiv r \pmod n$ remains off-protocol.
-    pub const W_C: usize = 21;
-    pub const W_D: usize = 22;
-
-    pub const NUM_INT: usize = 23;
+    pub const NUM_INT: usize = 31;
 
     // Flat indices for shift specs (no bin/poly columns; flat = int).
     pub const FLAT_W_X: usize = W_X;
@@ -197,7 +399,7 @@ where
         b: &mut B,
         up: TraceRow<B::Expr>,
         down: TraceRow<B::Expr>,
-        _from_ref: FromR,
+        from_ref: FromR,
         mbs: MulByScalar,
         _ideal_from_ref: IFromR,
     ) where
@@ -206,259 +408,303 @@ where
         MulByScalar: Fn(&B::Expr, &Self::Scalar) -> Option<B::Expr>,
         IFromR: Fn(&Self::Ideal) -> B::Ideal,
     {
-        let int = up.int;
-        let s_init = &int[cols::S_INIT];
-        let s_active = &int[cols::S_ACTIVE];
-        let s_final = &int[cols::S_FINAL];
-        let s_add = &int[cols::S_ADD];
-        let pa_b1 = &int[cols::PA_B1];
-        let pa_b2 = &int[cols::PA_B2];
-        let pa_qx = &int[cols::PA_QX];
-        let pa_qy = &int[cols::PA_QY];
-        let pa_qgx = &int[cols::PA_QGX];
-        let pa_qgy = &int[cols::PA_QGY];
-        let pa_r_init_x = &int[cols::PA_R_INIT_X];
-        let pa_r_init_y = &int[cols::PA_R_INIT_Y];
-        let pa_r_init_z = &int[cols::PA_R_INIT_Z];
-        let pa_z_inv = &int[cols::PA_Z_INV];
-        let pa_r_x = &int[cols::PA_R_X];
-        let x = &int[cols::W_X];
-        let y = &int[cols::W_Y];
-        let z = &int[cols::W_Z];
-        let x_pa = &int[cols::W_X_PA];
-        let y_pa = &int[cols::W_Y_PA];
-        let z_pa = &int[cols::W_Z_PA];
-        let c = &int[cols::W_C];
-        let d = &int[cols::W_D];
-
-        // down.int[i] in source-col-ascending order: X, Y, Z.
-        let down_x = &down.int[0];
-        let down_y = &down.int[1];
-        let down_z = &down.int[2];
-
-        let two_scalar = const_scalar::<R>(R::from(2_u32));
-        let three_scalar = const_scalar::<R>(R::from(3_u32));
-        let eight_scalar = const_scalar::<R>(R::from(8_u32));
-        let nine_scalar = const_scalar::<R>(R::from(9_u32));
-        let twelve_scalar = const_scalar::<R>(R::from(12_u32));
-
-        // ===================================================================
-        // In-circuit affine addend selection (replaces the verifier-supplied
-        // `PA_X_ADDEND, PA_Y_ADDEND` columns of the previous design).
-        //
-        // Given the bit pair `(b_1, b_2) ∈ {0,1}²`, the addend
-        // T ∈ {O, G, Q, G+Q} is selected as
-        //   T = (1-b_1)(1-b_2)·O + b_1(1-b_2)·G + (1-b_1)b_2·Q + b_1·b_2·(G+Q),
-        // which simplifies (using O = (·,·) gated out by `S_ADD`, since
-        // `S_ADD = 0` exactly when `(b_1, b_2) = (0,0)`) to the algebraic
-        // identity
-        //   T_x = b_1·(G_x − b_2·G_x) + b_2·(Q_x − b_1·Q_x) + b_1·b_2·(G+Q)_x
-        //       = b_1·G_x + b_2·Q_x + b_1·b_2·((G+Q)_x − G_x − Q_x).
-        // Symmetrically for T_y.
-        //
-        // Encodes G as a UAIR scalar (constant across proofs) and reads
-        // Q, G+Q from public columns (per-proof but row-constant). For
-        // the synthetic test below the scalar value is set to 0 since
-        // the test exercises bit pair `(0, 1)` → addend = Q.
-        //
-        // TODO(prod): replace the placeholder G_X / G_Y scalars with the
-        // canonical secp256k1 generator coordinates.
-        // ===================================================================
-
-        let g_x_scalar = const_scalar::<R>(R::from(0_u32));
-        let g_y_scalar = const_scalar::<R>(R::from(0_u32));
-
-        // Helper: build the addend coordinate from (b_1, b_2, Q, G+Q, G).
-        //   T_coord = b_1·G_coord + b_2·Q_coord + b_1·b_2·((G+Q)_coord − G_coord − Q_coord)
-        let b1b2 = pa_b1.clone() * pa_b2;
-        let make_addend = |q_col: &B::Expr, qg_col: &B::Expr, g_scalar: &Self::Scalar| -> B::Expr {
-            // b_1 · G_coord
-            let b1_g = mbs(pa_b1, g_scalar).expect("b_1 · G_coord overflow");
-            // b_2 · Q_coord
-            let b2_q = pa_b2.clone() * q_col;
-            // b_1·b_2 · (G+Q)_coord
-            let bb_qg = b1b2.clone() * qg_col;
-            // b_1·b_2 · G_coord
-            let bb_g = mbs(&b1b2, g_scalar).expect("b_1·b_2·G_coord overflow");
-            // b_1·b_2 · Q_coord
-            let bb_q = b1b2.clone() * q_col;
-            // T_coord = b_1·G + b_2·Q + b_1·b_2·((G+Q) − G − Q)
-            b1_g + &b2_q + &bb_qg - &bb_g - &bb_q
-        };
-
-        let t_x = make_addend(pa_qx, pa_qgx, &g_x_scalar);
-        let t_y = make_addend(pa_qy, pa_qgy, &g_y_scalar);
-
-        // ===================================================================
-        // Doubling block (3 constraints; `S = Y²` is inlined). Operates
-        // on (X, Y, Z) → (X_pa, Y_pa, Z_pa). Max degree raised from 5 to
-        // 6 (D4's `12·X³·Y²` term ×s_active) — but the global max is
-        // already 6 from O2, so no net increase.
-        // ===================================================================
-
-        let y_sq = y.clone() * y;
-
-        // C-D2: Z_pa − 2·Y·Z = 0
-        let yz = y.clone() * z;
-        let two_yz = mbs(&yz, &two_scalar).expect("2·Y·Z overflow");
-        let d2_inner = z_pa.clone() - &two_yz;
-        b.assert_zero(s_active.clone() * &d2_inner);
-
-        // C-D3: X_pa − 9·X⁴ + 8·X·Y² = 0
-        let x_sq = x.clone() * x;
-        let x_pow4 = x_sq.clone() * &x_sq;
-        let nine_x4 = mbs(&x_pow4, &nine_scalar).expect("9·X⁴ overflow");
-        let x_y_sq = x.clone() * &y_sq;
-        let eight_x_y_sq = mbs(&x_y_sq, &eight_scalar).expect("8·X·Y² overflow");
-        let d3_inner = x_pa.clone() - &nine_x4 + &eight_x_y_sq;
-        b.assert_zero(s_active.clone() * &d3_inner);
-
-        // C-D4: Y_pa − 12·X³·Y² + 3·X²·X_pa + 8·Y⁴ = 0
-        let x3_y_sq = x_sq.clone() * &x_y_sq;
-        let twelve_x3_y_sq =
-            mbs(&x3_y_sq, &twelve_scalar).expect("12·X³·Y² overflow");
-        let x_sq_x_pa = x_sq.clone() * x_pa;
-        let three_x2_xpa =
-            mbs(&x_sq_x_pa, &three_scalar).expect("3·X²·X_pa overflow");
-        let y_pow4 = y_sq.clone() * &y_sq;
-        let eight_y_pow4 = mbs(&y_pow4, &eight_scalar).expect("8·Y⁴ overflow");
-        let d4_inner =
-            y_pa.clone() - &twelve_x3_y_sq + &three_x2_xpa + &eight_y_pow4;
-        b.assert_zero(s_active.clone() * &d4_inner);
-
-        // ===================================================================
-        // Addition scratch (2 constraints). Z_pa², Z_pa³, C², C³, X_pa·C²
-        // are all inlined — only C and D have witness columns (matching
-        // the spec's `H` and `R_a`).
-        // ===================================================================
-
-        // C-A1: C − T_x·Z_pa² + X_pa = 0
-        // T_x is degree 3 in trace cells (b_1·b_2·Q_x is deg-3 column-column-column),
-        // so the constraint reaches deg 5; ×s_active = deg 6.
-        let z_pa_sq = z_pa.clone() * z_pa;
-        let a1_inner = c.clone() + x_pa - &(t_x * &z_pa_sq);
-        b.assert_zero(s_active.clone() * &a1_inner);
-
-        // C-A2: D − T_y·Z_pa³ + Y_pa = 0
-        // T_y is degree 3; with z_pa_cube (deg 3) and s_active (deg 1), reaches deg 7.
-        let z_pa_cube = z_pa.clone() * &z_pa_sq;
-        let a2_inner = d.clone() + y_pa - &(t_y * &z_pa_cube);
-        b.assert_zero(s_active.clone() * &a2_inner);
-
-        // ===================================================================
-        // Output-selection-and-chaining (3 constraints). Addition outputs
-        // are inlined with `E = C², F = C³, G = X_pa·C²` substituted:
-        //
-        //   X_add = D² − C³ − 2·X_pa·C²
-        //   Y_add = D·(X_pa·C² − X_add) − Y_pa·C³
-        //         = 3·D·X_pa·C² + D·C³ − D³ − Y_pa·C³
-        //   Z_add = Z_pa·C
-        //
-        //   down.X = X_pa + S_ADD·(X_add − X_pa)        (deg 5 with s_active)
-        //   down.Y = Y_pa + S_ADD·(Y_add − Y_pa)        (deg 6 with s_active)
-        //   down.Z = Z_pa + S_ADD·(Z_add − Z_pa)        (deg 4 with s_active)
-        //
-        // The deg-6 monomial in O2 is `s_active · S_ADD · D · X_pa · C²`
-        // — matches the spec's `s_reg · R_a · X_mid · H²`.
-        // ===================================================================
-
-        // C-O1 (X): down.X − X_pa − S_ADD·(D² − C³ − 2·X_pa·C² − X_pa) = 0
-        let c_sq = c.clone() * c;
-        let c_cube = c.clone() * &c_sq;
-        let x_pa_c_sq = x_pa.clone() * &c_sq;
-        let two_x_pa_c_sq = mbs(&x_pa_c_sq, &two_scalar).expect("2·X_pa·C² overflow");
-        let d_sq = d.clone() * d;
-        let x_add_minus_x_pa = d_sq.clone() - &c_cube - &two_x_pa_c_sq - x_pa;
-        let s_add_x = s_add.clone() * &x_add_minus_x_pa;
-        let o1_inner = down_x.clone() - x_pa - &s_add_x;
-        b.assert_zero(s_active.clone() * &o1_inner);
-
-        // C-O2 (Y): down.Y − Y_pa − S_ADD·(3·D·X_pa·C² + D·C³ − D³ − Y_pa·C³ − Y_pa) = 0
-        let d_cube = d.clone() * &d_sq;
-        let d_x_pa_c_sq = d.clone() * &x_pa_c_sq;
-        let three_d_x_pa_c_sq =
-            mbs(&d_x_pa_c_sq, &three_scalar).expect("3·D·X_pa·C² overflow");
-        let d_c_cube = d.clone() * &c_cube;
-        let y_pa_c_cube = y_pa.clone() * &c_cube;
-        let y_add_minus_y_pa =
-            three_d_x_pa_c_sq + &d_c_cube - &d_cube - &y_pa_c_cube - y_pa;
-        let s_add_y = s_add.clone() * &y_add_minus_y_pa;
-        let o2_inner = down_y.clone() - y_pa - &s_add_y;
-        b.assert_zero(s_active.clone() * &o2_inner);
-
-        // C-O3 (Z): down.Z − Z_pa − S_ADD·(Z_pa·C − Z_pa) = 0
-        let z_pa_c = z_pa.clone() * c;
-        let z_add_minus_z_pa = z_pa_c - z_pa;
-        let s_add_z = s_add.clone() * &z_add_minus_z_pa;
-        let o3_inner = down_z.clone() - z_pa - &s_add_z;
-        b.assert_zero(s_active.clone() * &o3_inner);
-
-        // ===================================================================
-        // Init boundary: at row 0, R = (PA_R_INIT_X, PA_R_INIT_Y, PA_R_INIT_Z).
-        // ===================================================================
-
-        b.assert_zero(s_init.clone() * &(x.clone() - pa_r_init_x));
-        b.assert_zero(s_init.clone() * &(y.clone() - pa_r_init_y));
-        b.assert_zero(s_init.clone() * &(z.clone() - pa_r_init_z));
-
-        // ===================================================================
-        // Final-row affine readout (2 constraints, gated by S_FINAL).
-        //
-        // Pins the loop's final Jacobian point P[FINAL_ROW] to its affine
-        // x-coordinate via two public columns Z_inv and R_x:
-        //
-        //   F1: P_Z · Z_inv − 1 ≡ 0       (non-infinity + Z_inv = P_Z⁻¹)
-        //   F2: P_X · Z_inv²   − R_x ≡ 0  (R_x is the affine x of P)
-        //
-        // Both at the up row, gated by S_FINAL = 1 (only at row
-        // FINAL_ROW). F1 forces P_Z[FINAL_ROW] ≠ 0 (else the equation
-        // can't be satisfied) and pins Z_inv to be its inverse mod p;
-        // F2 then derives R_x from P_X and Z_inv. The order-field check
-        //   R_x ≡ r  (mod n)
-        // is NOT enforced in-circuit — the verifier is expected to check
-        // it off-protocol against the signature scalar r, using the
-        // public column R_x. Since R_x and r are both public, this is a
-        // verifier-side equality check that does not need an in-circuit
-        // ideal constraint.
-        // ===================================================================
-
-        // F1: S_FINAL · (P_Z · Z_inv − 1) ∈ (p)    (deg 3 with s_final)
-        // Encoded as `S_FINAL · P_Z · Z_inv − S_FINAL = 0`, i.e.
-        // factoring out S_FINAL and subtracting it itself in place of
-        // `S_FINAL · 1` (avoids constructing a literal-1 expression).
-        let f1_lhs = s_final.clone() * &(z.clone() * pa_z_inv);
-        b.assert_zero(f1_lhs - s_final);
-
-        // F2: S_FINAL · (P_X · Z_inv² − R_x) ∈ (p)    (deg 4 with s_final)
-        let zinv_sq = pa_z_inv.clone() * pa_z_inv;
-        let f2_inner = x.clone() * &zinv_sq - pa_r_x;
-        b.assert_zero(s_final.clone() * &f2_inner);
-
-        // ===================================================================
-        // SOUNDNESS OBLIGATION (not yet enforced; deferred to follow-up):
-        //
-        // The new in-circuit addend selector relies on
-        //   - PA_B1[t], PA_B2[t] ∈ {0, 1} on every active row, and
-        //   - S_ADD[t]  = PA_B1[t] + PA_B2[t] − PA_B1[t]·PA_B2[t]
-        // (with PA_QX, PA_QY, PA_QGX, PA_QGY constant across active
-        // rows of a single proof, matching the public key Q and the
-        // verifier-derivable G + Q).
-        //
-        // Without those checks, a malicious prover could place
-        // arbitrary values in PA_B1 / PA_B2 (they're public columns
-        // typed as `Int<5>`, not range-restricted by the framework)
-        // and compose any addend it likes via the linear formula.
-        // The intended discharge is `Uair::verify_public_structure`,
-        // following the SHA UAIR's pattern of direct row-wise
-        // inspection of `public_trace`. That requires widening the
-        // trait method's `IntT` bound from `Clone + num_traits::Zero`
-        // to additionally include `PartialEq + num_traits::One` so
-        // the impl can compare `PA_B1[t]` against the canonical
-        // `0` / `1`. Tracked as a follow-up; the synthetic test
-        // below populates the columns honestly so the round-trip
-        // succeeds.
-        // ===================================================================
+        constrain_rcb_shamir(
+            b,
+            &up.int[..cols::NUM_INT_PUB],
+            &up.int[cols::NUM_INT_PUB..],
+            down.int,
+            from_ref,
+            mbs,
+        );
     }
+
+    fn verify_public_structure<RT, IntT, const D: usize>(
+        public_trace: &UairTrace<'_, RT, IntT, D>,
+        num_vars: usize,
+    ) -> Result<(), PublicStructureError>
+    where
+        RT: Clone,
+        IntT: Clone + num_traits::Zero + num_traits::One + PartialEq,
+    {
+        verify_ecdsa_public_int_structure(&public_trace.int, num_vars)
+    }
+}
+
+/// Constrain one complete Shamir row using the RCB formulas in ordinary
+/// projective coordinates. `public` uses the standalone ECDSA public layout;
+/// `witness` starts at `W_X`; `down` contains the shifted state `(X,Y,Z)`.
+pub(crate) fn constrain_rcb_shamir<R, B, FromR, MulByScalar>(
+    b: &mut B,
+    public: &[B::Expr],
+    witness: &[B::Expr],
+    down: &[B::Expr],
+    from_ref: FromR,
+    mbs: MulByScalar,
+) where
+    R: EcdsaFpRing,
+    B: ConstraintBuilder,
+    FromR: Fn(&DensePolynomial<R, 32>) -> B::Expr,
+    MulByScalar: Fn(&B::Expr, &DensePolynomial<R, 32>) -> Option<B::Expr>,
+{
+    debug_assert_eq!(public.len(), cols::NUM_INT_PUB);
+    debug_assert_eq!(witness.len(), cols::NUM_INT - cols::NUM_INT_PUB);
+    debug_assert_eq!(down.len(), 3);
+
+    let s_init = &public[cols::S_INIT];
+    let s_active = &public[cols::S_ACTIVE];
+    let s_final = &public[cols::S_FINAL];
+    let s_add = &public[cols::S_ADD];
+    let pa_b1 = &public[cols::PA_B1];
+    let pa_b2 = &public[cols::PA_B2];
+    let pa_b1b2 = &public[cols::PA_B1B2];
+    let pa_qx = &public[cols::PA_QX];
+    let pa_qy = &public[cols::PA_QY];
+    let pa_qgx = &public[cols::PA_QGX];
+    let pa_qgy = &public[cols::PA_QGY];
+    let pa_t_x = &public[cols::PA_T_X];
+    let pa_t_y = &public[cols::PA_T_Y];
+    let pa_r_init_x = &public[cols::PA_R_INIT_X];
+    let pa_r_init_y = &public[cols::PA_R_INIT_Y];
+    let pa_r_init_z = &public[cols::PA_R_INIT_Z];
+    let pa_z_inv = &public[cols::PA_Z_INV];
+    let pa_r_x = &public[cols::PA_R_X];
+
+    let at = |global: usize| -> &B::Expr { &witness[global - cols::NUM_INT_PUB] };
+    let x = at(cols::W_X);
+    let y = at(cols::W_Y);
+    let z = at(cols::W_Z);
+    let d_t0 = at(cols::W_D_T0);
+    let d_t1 = at(cols::W_D_T1);
+    let d_t2 = at(cols::W_D_T2);
+    let d_t3 = at(cols::W_D_T3);
+    let d_t4 = at(cols::W_D_T4);
+    let d_t5 = at(cols::W_D_T5);
+    let a_t0 = at(cols::W_A_T0);
+    let a_t1 = at(cols::W_A_T1);
+    let a_t2 = at(cols::W_A_T2);
+    let a_t4 = at(cols::W_A_T4);
+    let down_x = &down[0];
+    let down_y = &down[1];
+    let down_z = &down[2];
+
+    let one_scalar = const_scalar::<R>(R::ONE);
+    let two_scalar = const_scalar::<R>(R::from(2_u32));
+    let three_scalar = const_scalar::<R>(R::from(3_u32));
+    let four_scalar = const_scalar::<R>(R::from(4_u32));
+    let b3_scalar = const_scalar::<R>(R::from(21_u32));
+    let g_x_scalar = const_scalar::<R>(R::from(uint_to_int(SECP256K1_G_X_UINT)));
+    let g_y_scalar = const_scalar::<R>(R::from(uint_to_int(SECP256K1_G_Y_UINT)));
+
+    // Bind the public ordinary-projective addend `(T_X:T_Y:S_ADD)` to
+    // the verifier-checked bit selectors and the public Q/G+Q points.
+    let selected_coord = |q: &B::Expr, qg: &B::Expr, g: &DensePolynomial<R, 32>| -> B::Expr {
+        let b1_g = mbs(pa_b1, g).expect("b1 * G overflow");
+        let b2_q = pa_b2.clone() * q;
+        let b11_qg = pa_b1b2.clone() * qg;
+        let b11_g = mbs(pa_b1b2, g).expect("b1b2 * G overflow");
+        let b11_q = pa_b1b2.clone() * q;
+        b1_g + &b2_q + &b11_qg - &b11_g - &b11_q
+    };
+    let selected_x = selected_coord(pa_qx, pa_qgx, &g_x_scalar);
+    let selected_y = selected_coord(pa_qy, pa_qgy, &g_y_scalar);
+    b.assert_zero(s_active.clone() * &(pa_t_x.clone() - &selected_x));
+    let identity_y = from_ref(&one_scalar) - s_add;
+    b.assert_zero(s_active.clone() * &(pa_t_y.clone() - &selected_y - &identity_y));
+
+    // Complete RCB doubling, specialized to secp256k1 (a=0, 3b=21).
+    b.assert_zero(s_active.clone() * &(d_t0.clone() - &(x.clone() * x)));
+    b.assert_zero(s_active.clone() * &(d_t1.clone() - &(y.clone() * y)));
+    b.assert_zero(s_active.clone() * &(d_t2.clone() - &(z.clone() * z)));
+    b.assert_zero(s_active.clone() * &(d_t3.clone() - &(x.clone() * y)));
+    b.assert_zero(s_active.clone() * &(d_t4.clone() - &(x.clone() * z)));
+    b.assert_zero(s_active.clone() * &(d_t5.clone() - &(y.clone() * z)));
+
+    let b3_d_t2 = mbs(d_t2, &b3_scalar).expect("21 * d_t2 overflow");
+    let d_x_base = d_t1.clone() - &b3_d_t2;
+    let d_z_base = d_t1.clone() + &b3_d_t2;
+    let two_d_t3 = mbs(d_t3, &two_scalar).expect("2 * d_t3 overflow");
+    let two_d_t4 = mbs(d_t4, &two_scalar).expect("2 * d_t4 overflow");
+    let d_t4_b3 = mbs(&two_d_t4, &b3_scalar).expect("42 * d_t4 overflow");
+    let two_d_t5 = mbs(d_t5, &two_scalar).expect("2 * d_t5 overflow");
+    let three_d_t0 = mbs(d_t0, &three_scalar).expect("3 * d_t0 overflow");
+
+    let doubled_x = two_d_t3.clone() * &d_x_base - &(two_d_t5.clone() * &d_t4_b3);
+    let doubled_y = d_x_base.clone() * &d_z_base + &(three_d_t0 * &d_t4_b3);
+    let doubled_z_product = two_d_t5 * d_t1;
+    let doubled_z = mbs(&doubled_z_product, &four_scalar).expect("4 * doubled z overflow");
+    // Complete RCB addition of the doubled point and `(T_X:T_Y:S_ADD)`.
+    // The doubled coordinates are exact expressions in the six doubling
+    // products. Inlining them removes three committed columns while preserving
+    // the same complete group law; the three diagonal product constraints
+    // become degree 4.
+    b.assert_zero(s_active.clone() * &(a_t0.clone() - &(doubled_x.clone() * pa_t_x)));
+    b.assert_zero(s_active.clone() * &(a_t1.clone() - &(doubled_y.clone() * pa_t_y)));
+    b.assert_zero(s_active.clone() * &(a_t2.clone() - &(doubled_z.clone() * s_add)));
+
+    // `T3` and `T5` are consumed only here and are safe to inline together.
+    // Keeping `T4` materialized prevents the final `T5 * T4` product from
+    // multiplying two degree-three expressions, so the gated outputs stay at
+    // degree 5.
+    let add_t3 = (doubled_x.clone() + &doubled_y) * &(pa_t_x.clone() + pa_t_y)
+        - a_t0
+        - a_t1;
+    let add_t4_expr = (doubled_x + &doubled_z) * &(pa_t_x.clone() + s_add) - a_t0 - a_t2;
+    b.assert_zero(s_active.clone() * &(a_t4.clone() - &add_t4_expr));
+    let add_t5 = (doubled_y + doubled_z) * &(pa_t_y.clone() + s_add) - a_t1 - a_t2;
+    let b3_a_t2 = mbs(a_t2, &b3_scalar).expect("21 * a_t2 overflow");
+    let add_x_base = a_t1.clone() - &b3_a_t2;
+    let add_z_base = a_t1.clone() + &b3_a_t2;
+    let three_a_t0 = mbs(a_t0, &three_scalar).expect("3 * a_t0 overflow");
+    let b3_add_t4 = mbs(a_t4, &b3_scalar).expect("21 * add_t4 overflow");
+
+    let added_x = add_t3.clone() * &add_x_base - &(add_t5.clone() * &b3_add_t4);
+    let added_y = add_x_base.clone() * &add_z_base + &(three_a_t0.clone() * &b3_add_t4);
+    let added_z = add_t5 * &add_z_base + &(add_t3 * &three_a_t0);
+    b.assert_zero(s_active.clone() * &(down_x.clone() - &added_x));
+    b.assert_zero(s_active.clone() * &(down_y.clone() - &added_y));
+    b.assert_zero(s_active.clone() * &(down_z.clone() - &added_z));
+
+    // Start from the verifier-pinned projective identity and expose the final
+    // ordinary-projective affine x-coordinate.
+    b.assert_zero(s_init.clone() * &(x.clone() - pa_r_init_x));
+    b.assert_zero(s_init.clone() * &(y.clone() - pa_r_init_y));
+    b.assert_zero(s_init.clone() * &(z.clone() - pa_r_init_z));
+    let f1_lhs = s_final.clone() * &(z.clone() * pa_z_inv);
+    b.assert_zero(f1_lhs - s_final);
+    let f2_inner = x.clone() * pa_z_inv - pa_r_x;
+    b.assert_zero(s_final.clone() * &f2_inner);
+}
+
+fn expect_public_value<IntT: PartialEq>(
+    columns: &[DenseMultilinearExtension<IntT>],
+    column: usize,
+    row: usize,
+    expected: &IntT,
+    name: &'static str,
+) -> Result<(), PublicStructureError> {
+    if &columns[column][row] != expected {
+        return Err(PublicStructureError::WrongValue { column: name, row });
+    }
+    Ok(())
+}
+
+/// Verify the row-wise public contract used by the complete ECDSA slice.
+pub(crate) fn verify_ecdsa_public_int_structure<IntT>(
+    public: &[DenseMultilinearExtension<IntT>],
+    num_vars: usize,
+) -> Result<(), PublicStructureError>
+where
+    IntT: Clone + num_traits::Zero + num_traits::One + PartialEq,
+{
+    let n = 1usize << num_vars;
+    if n <= FINAL_ROW || public.len() != cols::NUM_INT_PUB {
+        return Err(PublicStructureError::WrongValue {
+            column: "ECDSA_PUBLIC_LAYOUT",
+            row: n,
+        });
+    }
+    let zero = IntT::zero();
+    let one = IntT::one();
+    let qx = public[cols::PA_QX][0].clone();
+    let qy = public[cols::PA_QY][0].clone();
+    let qgx = public[cols::PA_QGX][0].clone();
+    let qgy = public[cols::PA_QGY][0].clone();
+
+    for row in 0..n {
+        let active = row < NUM_SHAMIR_ROUNDS;
+        expect_public_value(
+            public,
+            cols::S_INIT,
+            row,
+            if row == 0 { &one } else { &zero },
+            "S_INIT",
+        )?;
+        expect_public_value(
+            public,
+            cols::S_ACTIVE,
+            row,
+            if active { &one } else { &zero },
+            "S_ACTIVE",
+        )?;
+        expect_public_value(
+            public,
+            cols::S_FINAL,
+            row,
+            if row == FINAL_ROW { &one } else { &zero },
+            "S_FINAL",
+        )?;
+
+        if active {
+            let b1 = &public[cols::PA_B1][row];
+            let b2 = &public[cols::PA_B2][row];
+            let b1_one = b1 == &one;
+            let b2_one = b2 == &one;
+            if !b1_one && b1 != &zero {
+                return Err(PublicStructureError::WrongValue {
+                    column: "PA_B1",
+                    row,
+                });
+            }
+            if !b2_one && b2 != &zero {
+                return Err(PublicStructureError::WrongValue {
+                    column: "PA_B2",
+                    row,
+                });
+            }
+            expect_public_value(
+                public,
+                cols::PA_B1B2,
+                row,
+                if b1_one && b2_one { &one } else { &zero },
+                "PA_B1B2",
+            )?;
+            expect_public_value(
+                public,
+                cols::S_ADD,
+                row,
+                if b1_one || b2_one { &one } else { &zero },
+                "S_ADD",
+            )?;
+            for (column, expected, name) in [
+                (cols::PA_QX, &qx, "PA_QX"),
+                (cols::PA_QY, &qy, "PA_QY"),
+                (cols::PA_QGX, &qgx, "PA_QGX"),
+                (cols::PA_QGY, &qgy, "PA_QGY"),
+            ] {
+                expect_public_value(public, column, row, expected, name)?;
+            }
+        } else {
+            for (column, name) in [
+                (cols::S_ADD, "S_ADD"),
+                (cols::PA_B1, "PA_B1"),
+                (cols::PA_B2, "PA_B2"),
+                (cols::PA_B1B2, "PA_B1B2"),
+                (cols::PA_QX, "PA_QX"),
+                (cols::PA_QY, "PA_QY"),
+                (cols::PA_QGX, "PA_QGX"),
+                (cols::PA_QGY, "PA_QGY"),
+                (cols::PA_T_X, "PA_T_X"),
+                (cols::PA_T_Y, "PA_T_Y"),
+            ] {
+                expect_public_value(public, column, row, &zero, name)?;
+            }
+        }
+
+        expect_public_value(public, cols::PA_R_INIT_X, row, &zero, "PA_R_INIT_X")?;
+        expect_public_value(
+            public,
+            cols::PA_R_INIT_Y,
+            row,
+            if row == 0 { &one } else { &zero },
+            "PA_R_INIT_Y",
+        )?;
+        expect_public_value(public, cols::PA_R_INIT_Z, row, &zero, "PA_R_INIT_Z")?;
+        if row != FINAL_ROW {
+            expect_public_value(public, cols::PA_Z_INV, row, &zero, "PA_Z_INV")?;
+            expect_public_value(public, cols::PA_R_X, row, &zero, "PA_R_X")?;
+        }
+    }
+    Ok(())
 }
 
 /// Build a constant-polynomial (degree 0) `c` as a `DensePolynomial<R, 32>`.
@@ -472,35 +718,13 @@ fn const_scalar<R: ConstSemiring>(c: R) -> DensePolynomial<R, 32> {
 // F_p arithmetic helpers.
 // ---------------------------------------------------------------------------
 
-fn rand_fp<Rng: RngCore + ?Sized>(rng: &mut Rng) -> CbUint<EC_FP_INT_LIMBS> {
-    let p_nz = NonZero::new(SECP256K1_P_UINT).expect("p is nonzero");
-    let mut limbs = [0u64; EC_FP_INT_LIMBS];
-    for limb in &mut limbs {
-        *limb = rng.next_u64();
-    }
-    let raw = CbUint::<EC_FP_INT_LIMBS>::from_words(limbs);
-    raw.rem_vartime(&p_nz)
-}
-
-fn rand_nonzero_fp<Rng: RngCore + ?Sized>(rng: &mut Rng) -> CbUint<EC_FP_INT_LIMBS> {
-    use crypto_bigint::Zero as _;
-    loop {
-        let candidate = rand_fp(rng);
-        if !bool::from(candidate.is_zero()) {
-            return candidate;
-        }
-    }
-}
-
 fn inv_mod_p(a: &CbUint<EC_FP_INT_LIMBS>) -> CbUint<EC_FP_INT_LIMBS> {
     let p_odd = Odd::new(SECP256K1_P_UINT).expect("p is odd");
-    a.invert_odd_mod(&p_odd).expect("a has no inverse mod p (a == 0?)")
+    a.invert_odd_mod(&p_odd)
+        .expect("a has no inverse mod p (a == 0?)")
 }
 
-fn mul_mod_p(
-    a: &CbUint<EC_FP_INT_LIMBS>,
-    b: &CbUint<EC_FP_INT_LIMBS>,
-) -> CbUint<EC_FP_INT_LIMBS> {
+fn mul_mod_p(a: &CbUint<EC_FP_INT_LIMBS>, b: &CbUint<EC_FP_INT_LIMBS>) -> CbUint<EC_FP_INT_LIMBS> {
     let wide: CbUint<{ EC_FP_INT_LIMBS * 2 }> = a.widening_mul(b).into();
     let p_wide: CbUint<{ EC_FP_INT_LIMBS * 2 }> = SECP256K1_P_UINT.resize();
     let p_wide_nz = NonZero::new(p_wide).expect("p is nonzero");
@@ -508,35 +732,46 @@ fn mul_mod_p(
     rem.resize()
 }
 
+fn add_mod_p(a: &CbUint<EC_FP_INT_LIMBS>, b: &CbUint<EC_FP_INT_LIMBS>) -> CbUint<EC_FP_INT_LIMBS> {
+    let a_wide: CbUint<{ EC_FP_INT_LIMBS * 2 }> = a.resize();
+    let b_wide: CbUint<{ EC_FP_INT_LIMBS * 2 }> = b.resize();
+    let sum = a_wide.wrapping_add(&b_wide);
+    let p_wide: CbUint<{ EC_FP_INT_LIMBS * 2 }> = SECP256K1_P_UINT.resize();
+    let p_wide_nz = NonZero::new(p_wide).expect("p is nonzero");
+    let (_, rem) = sum.div_rem_vartime(&p_wide_nz);
+    rem.resize()
+}
+
+/// Return whether `(x, y)` is a canonical affine secp256k1 point.
+pub fn is_secp256k1_affine_point(
+    x: &CbUint<EC_FP_INT_LIMBS>,
+    y: &CbUint<EC_FP_INT_LIMBS>,
+) -> bool {
+    if *x >= SECP256K1_P_UINT || *y >= SECP256K1_P_UINT {
+        return false;
+    }
+    let x_squared = mul_mod_p(x, x);
+    let x_cubed = mul_mod_p(&x_squared, x);
+    let rhs = add_mod_p(&x_cubed, &CbUint::from_u64(7));
+    mul_mod_p(y, y) == rhs
+}
+
 fn small_mul_mod_p(a: &CbUint<EC_FP_INT_LIMBS>, k: u32) -> CbUint<EC_FP_INT_LIMBS> {
-    let p_nz = NonZero::new(SECP256K1_P_UINT).expect("p is nonzero");
     let mut acc = CbUint::<EC_FP_INT_LIMBS>::ZERO;
     for _ in 0..k {
-        acc = acc.wrapping_add(a);
-        if p_geq(&acc) {
-            acc = acc.rem_vartime(&p_nz);
-        }
+        acc = add_mod_p(&acc, a);
     }
     acc
 }
 
-#[inline]
-fn p_geq(a: &CbUint<EC_FP_INT_LIMBS>) -> bool {
-    use crypto_bigint::CheckedSub;
-    a.checked_sub(&SECP256K1_P_UINT).is_some().into()
-}
-
-fn sub_mod_p(
-    a: &CbUint<EC_FP_INT_LIMBS>,
-    b: &CbUint<EC_FP_INT_LIMBS>,
-) -> CbUint<EC_FP_INT_LIMBS> {
+fn sub_mod_p(a: &CbUint<EC_FP_INT_LIMBS>, b: &CbUint<EC_FP_INT_LIMBS>) -> CbUint<EC_FP_INT_LIMBS> {
     use crypto_bigint::CheckedSub;
     let p_nz = NonZero::new(SECP256K1_P_UINT).expect("p is nonzero");
     if a.checked_sub(b).is_some().into() {
         a.wrapping_sub(b).rem_vartime(&p_nz)
     } else {
-        let a_plus_p = a.wrapping_add(&SECP256K1_P_UINT);
-        a_plus_p.wrapping_sub(b).rem_vartime(&p_nz)
+        let difference = b.wrapping_sub(a);
+        SECP256K1_P_UINT.wrapping_sub(&difference)
     }
 }
 
@@ -554,100 +789,339 @@ fn uint_to_int(u: CbUint<EC_FP_INT_LIMBS>) -> Int<EC_FP_INT_LIMBS> {
 // Reference per-step computation (for witness gen and tests).
 // ---------------------------------------------------------------------------
 
-/// One Shamir step: Jacobian state R_t plus the per-row witness
-/// columns (X_pa, Y_pa, Z_pa, C, D). `S = Y²` and the addition outputs
-/// (X_add, Y_add, Z_add) are computed inline but not stored — only the
-/// selected `(next_x, next_y, next_z)` is emitted (which equals R_{t+1}).
-struct StepValues {
-    x_pa: CbUint<EC_FP_INT_LIMBS>,
-    y_pa: CbUint<EC_FP_INT_LIMBS>,
-    z_pa: CbUint<EC_FP_INT_LIMBS>,
-    c: CbUint<EC_FP_INT_LIMBS>,
-    d: CbUint<EC_FP_INT_LIMBS>,
-    /// `R_{t+1}` (= `down.X[t]` etc., constraints' chosen output).
-    next_x: CbUint<EC_FP_INT_LIMBS>,
-    next_y: CbUint<EC_FP_INT_LIMBS>,
-    next_z: CbUint<EC_FP_INT_LIMBS>,
+/// One complete ordinary-projective Shamir step and its materialized products.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ProjectivePoint {
+    x: CbUint<EC_FP_INT_LIMBS>,
+    y: CbUint<EC_FP_INT_LIMBS>,
+    z: CbUint<EC_FP_INT_LIMBS>,
 }
 
-fn compute_step(
-    x1: &CbUint<EC_FP_INT_LIMBS>,
-    y1: &CbUint<EC_FP_INT_LIMBS>,
-    z1: &CbUint<EC_FP_INT_LIMBS>,
-    pa_x: &CbUint<EC_FP_INT_LIMBS>,
-    pa_y: &CbUint<EC_FP_INT_LIMBS>,
-    s_add_bit: bool,
-) -> StepValues {
-    // --- Doubling ---
-    let s = mul_mod_p(y1, y1);
-    let x_sq = mul_mod_p(x1, x1);
-    let x_quad = mul_mod_p(&x_sq, &x_sq);
-    let xs = mul_mod_p(x1, &s);
-    let nine_xq = small_mul_mod_p(&x_quad, 9);
-    let eight_xs = small_mul_mod_p(&xs, 8);
-    let x_pa = sub_mod_p(&nine_xq, &eight_xs);
-
-    let yz = mul_mod_p(y1, z1);
-    let z_pa = small_mul_mod_p(&yz, 2);
-
-    let four_xs = small_mul_mod_p(&xs, 4);
-    let four_xs_minus_xpa = sub_mod_p(&four_xs, &x_pa);
-    let three_xsq = small_mul_mod_p(&x_sq, 3);
-    let big_term = mul_mod_p(&three_xsq, &four_xs_minus_xpa);
-    let s_sq = mul_mod_p(&s, &s);
-    let eight_s_sq = small_mul_mod_p(&s_sq, 8);
-    let y_pa = sub_mod_p(&big_term, &eight_s_sq);
-
-    // --- Addition (computed inline, not stored as columns) ---
-    let z_pa_sq = mul_mod_p(&z_pa, &z_pa);
-    let z_pa_cube = mul_mod_p(&z_pa, &z_pa_sq);
-    let a_val = mul_mod_p(pa_x, &z_pa_sq);
-    let b_val = mul_mod_p(pa_y, &z_pa_cube);
-    let c = sub_mod_p(&a_val, &x_pa);
-    let d = sub_mod_p(&b_val, &y_pa);
-    let e = mul_mod_p(&c, &c);
-    let f = mul_mod_p(&c, &e);
-    let g = mul_mod_p(&x_pa, &e);
-
-    let d_sq = mul_mod_p(&d, &d);
-    let two_g = small_mul_mod_p(&g, 2);
-    let x_add = sub_mod_p(&sub_mod_p(&d_sq, &f), &two_g);
-
-    let g_minus_x_add = sub_mod_p(&g, &x_add);
-    let d_times = mul_mod_p(&d, &g_minus_x_add);
-    let y_pa_f = mul_mod_p(&y_pa, &f);
-    let y_add = sub_mod_p(&d_times, &y_pa_f);
-
-    let z_add = mul_mod_p(&z_pa, &c);
-
-    // --- Output selection ---
-    let (next_x, next_y, next_z) = if s_add_bit {
-        (x_add, y_add, z_add)
-    } else {
-        (x_pa.clone(), y_pa.clone(), z_pa.clone())
-    };
-
-    let _ = s; // computed locally to derive x_pa/y_pa, no longer a column.
-
-    StepValues {
-        x_pa,
-        y_pa,
-        z_pa,
-        c,
-        d,
-        next_x,
-        next_y,
-        next_z,
+impl ProjectivePoint {
+    fn identity() -> Self {
+        Self {
+            x: CbUint::ZERO,
+            y: CbUint::ONE,
+            z: CbUint::ZERO,
+        }
     }
+
+    fn affine(x: CbUint<EC_FP_INT_LIMBS>, y: CbUint<EC_FP_INT_LIMBS>) -> Self {
+        Self {
+            x,
+            y,
+            z: CbUint::ONE,
+        }
+    }
+}
+
+struct StepValues {
+    doubled_products: [CbUint<EC_FP_INT_LIMBS>; 6],
+    addition_products: [CbUint<EC_FP_INT_LIMBS>; 6],
+    next: ProjectivePoint,
+}
+
+fn rcb_double(point: &ProjectivePoint) -> ([CbUint<EC_FP_INT_LIMBS>; 6], ProjectivePoint) {
+    let t0 = mul_mod_p(&point.x, &point.x);
+    let t1 = mul_mod_p(&point.y, &point.y);
+    let t2 = mul_mod_p(&point.z, &point.z);
+    let t3 = mul_mod_p(&point.x, &point.y);
+    let t4 = mul_mod_p(&point.x, &point.z);
+    let t5 = mul_mod_p(&point.y, &point.z);
+
+    let b3_t2 = small_mul_mod_p(&t2, 21);
+    let x_base = sub_mod_p(&t1, &b3_t2);
+    let z_base = add_mod_p(&t1, &b3_t2);
+    let two_t3 = small_mul_mod_p(&t3, 2);
+    let t4_b3 = small_mul_mod_p(&small_mul_mod_p(&t4, 2), 21);
+    let two_t5 = small_mul_mod_p(&t5, 2);
+    let three_t0 = small_mul_mod_p(&t0, 3);
+
+    let x = sub_mod_p(&mul_mod_p(&two_t3, &x_base), &mul_mod_p(&two_t5, &t4_b3));
+    let y = add_mod_p(&mul_mod_p(&x_base, &z_base), &mul_mod_p(&three_t0, &t4_b3));
+    let z = small_mul_mod_p(&mul_mod_p(&two_t5, &t1), 4);
+
+    ([t0, t1, t2, t3, t4, t5], ProjectivePoint { x, y, z })
+}
+
+fn rcb_add(
+    left: &ProjectivePoint,
+    right: &ProjectivePoint,
+) -> ([CbUint<EC_FP_INT_LIMBS>; 6], ProjectivePoint) {
+    let t0 = mul_mod_p(&left.x, &right.x);
+    let t1 = mul_mod_p(&left.y, &right.y);
+    let t2 = mul_mod_p(&left.z, &right.z);
+    let t3_raw = mul_mod_p(&add_mod_p(&left.x, &left.y), &add_mod_p(&right.x, &right.y));
+    let t4_raw = mul_mod_p(&add_mod_p(&left.x, &left.z), &add_mod_p(&right.x, &right.z));
+    let t5_raw = mul_mod_p(&add_mod_p(&left.y, &left.z), &add_mod_p(&right.y, &right.z));
+
+    let t3 = sub_mod_p(&sub_mod_p(&t3_raw, &t0), &t1);
+    let t4 = sub_mod_p(&sub_mod_p(&t4_raw, &t0), &t2);
+    let t5 = sub_mod_p(&sub_mod_p(&t5_raw, &t1), &t2);
+    let b3_t2 = small_mul_mod_p(&t2, 21);
+    let x_base = sub_mod_p(&t1, &b3_t2);
+    let z_base = add_mod_p(&t1, &b3_t2);
+    let three_t0 = small_mul_mod_p(&t0, 3);
+    let b3_t4 = small_mul_mod_p(&t4, 21);
+
+    let x = sub_mod_p(&mul_mod_p(&t3, &x_base), &mul_mod_p(&t5, &b3_t4));
+    let y = add_mod_p(&mul_mod_p(&x_base, &z_base), &mul_mod_p(&three_t0, &b3_t4));
+    let z = add_mod_p(&mul_mod_p(&t5, &z_base), &mul_mod_p(&t3, &three_t0));
+
+    (
+        [t0, t1, t2, t3_raw, t4_raw, t5_raw],
+        ProjectivePoint { x, y, z },
+    )
+}
+
+fn compute_step(state: &ProjectivePoint, addend: &ProjectivePoint) -> StepValues {
+    let (doubled_products, doubled) = rcb_double(state);
+    let (addition_products, next) = rcb_add(&doubled, addend);
+    StepValues {
+        doubled_products,
+        addition_products,
+        next,
+    }
+}
+
+fn projective_to_affine(
+    point: &ProjectivePoint,
+) -> Option<(CbUint<EC_FP_INT_LIMBS>, CbUint<EC_FP_INT_LIMBS>)> {
+    use crypto_bigint::Zero as _;
+    if bool::from(point.z.is_zero()) {
+        return None;
+    }
+    let z_inv = inv_mod_p(&point.z);
+    Some((mul_mod_p(&point.x, &z_inv), mul_mod_p(&point.y, &z_inv)))
+}
+
+fn validate_public_key_uint(
+    q: (CbUint<EC_FP_INT_LIMBS>, CbUint<EC_FP_INT_LIMBS>),
+) -> Result<EcdsaBoundPublicKey, EcdsaPublicKeyBindingError> {
+    if q.0 >= SECP256K1_P_UINT {
+        return Err(EcdsaPublicKeyBindingError::CoordinateOutOfRange {
+            coordinate: EcdsaCoordinate::X,
+        });
+    }
+    if q.1 >= SECP256K1_P_UINT {
+        return Err(EcdsaPublicKeyBindingError::CoordinateOutOfRange {
+            coordinate: EcdsaCoordinate::Y,
+        });
+    }
+    if !is_secp256k1_affine_point(&q.0, &q.1) {
+        return Err(EcdsaPublicKeyBindingError::PointNotOnCurve);
+    }
+
+    let generator = ProjectivePoint::affine(SECP256K1_G_X_UINT, SECP256K1_G_Y_UINT);
+    let q_projective = ProjectivePoint::affine(q.0, q.1);
+    let (_, sum) = rcb_add(&generator, &q_projective);
+    let g_plus_q = projective_to_affine(&sum)
+        .ok_or(EcdsaPublicKeyBindingError::GeneratorSumAtInfinity)?;
+    Ok(EcdsaBoundPublicKey { q, g_plus_q })
+}
+
+/// Parse, validate, and add G to an affine-only secp256k1 public key.
+pub fn validate_secp256k1_public_key(
+    q_x_be: &[u8],
+    q_y_be: &[u8],
+) -> Result<EcdsaBoundPublicKey, EcdsaPublicKeyBindingError> {
+    if q_x_be.len() != 32 {
+        return Err(EcdsaPublicKeyBindingError::CoordinateEncoding {
+            coordinate: EcdsaCoordinate::X,
+            actual_bytes: q_x_be.len(),
+        });
+    }
+    if q_y_be.len() != 32 {
+        return Err(EcdsaPublicKeyBindingError::CoordinateEncoding {
+            coordinate: EcdsaCoordinate::Y,
+            actual_bytes: q_y_be.len(),
+        });
+    }
+    validate_public_key_uint((
+        CbUint::from_be_slice(q_x_be),
+        CbUint::from_be_slice(q_y_be),
+    ))
+}
+
+/// Bind every active public Q/G+Q cell to one canonical affine statement key.
+pub fn verify_ecdsa_public_key_binding_in_columns(
+    q_x_be: &[u8],
+    q_y_be: &[u8],
+    public_int: &[DenseMultilinearExtension<Int<EC_FP_INT_LIMBS>>],
+    columns: [usize; 4],
+) -> Result<EcdsaBoundPublicKey, EcdsaPublicKeyBindingError> {
+    let bound = validate_secp256k1_public_key(q_x_be, q_y_be)?;
+    let expected = [bound.q.0, bound.q.1, bound.g_plus_q.0, bound.g_plus_q.1];
+
+    for row in 0..NUM_SHAMIR_ROUNDS {
+        for (column, expected) in columns.into_iter().zip(expected) {
+            let cell = public_int
+                .get(column)
+                .and_then(|values| values.evaluations.get(row))
+                .ok_or(EcdsaPublicKeyBindingError::MissingPublicPoint { column, row })?;
+            let actual = decode_canonical_field_element(cell).ok_or(
+                EcdsaPublicKeyBindingError::NonCanonicalPublicPoint { column, row },
+            )?;
+            if actual != expected {
+                return Err(EcdsaPublicKeyBindingError::PublicPointMismatch { column, row });
+            }
+        }
+    }
+    Ok(bound)
+}
+
+fn select_addend(
+    bits: (bool, bool),
+    q: &(CbUint<EC_FP_INT_LIMBS>, CbUint<EC_FP_INT_LIMBS>),
+    g_plus_q: &(CbUint<EC_FP_INT_LIMBS>, CbUint<EC_FP_INT_LIMBS>),
+) -> ProjectivePoint {
+    match bits {
+        (false, false) => ProjectivePoint::identity(),
+        (true, false) => ProjectivePoint::affine(SECP256K1_G_X_UINT, SECP256K1_G_Y_UINT),
+        (false, true) => ProjectivePoint::affine(q.0, q.1),
+        (true, true) => ProjectivePoint::affine(g_plus_q.0, g_plus_q.1),
+    }
+}
+
+fn scalar_bits(value: &CbUint<EC_FP_INT_LIMBS>) -> [bool; NUM_SHAMIR_ROUNDS] {
+    let mut result = [false; NUM_SHAMIR_ROUNDS];
+    for (row, bit) in (0..NUM_SHAMIR_ROUNDS).rev().enumerate() {
+        let word = bit / 64;
+        let offset = bit % 64;
+        result[row] = ((value.as_words()[word] >> offset) & 1) == 1;
+    }
+    result
+}
+
+/// Build a trace for explicit public-key and Shamir-scalar inputs.
+///
+/// This constructor is used by application-level proof tests that need a
+/// deterministic result point rather than the random-trace fixture.
+pub fn build_trace_from_scalars<R>(
+    num_vars: usize,
+    q: (CbUint<EC_FP_INT_LIMBS>, CbUint<EC_FP_INT_LIMBS>),
+    u1: CbUint<EC_FP_INT_LIMBS>,
+    u2: CbUint<EC_FP_INT_LIMBS>,
+) -> Result<UairTrace<'static, R, R, 32>, EcdsaPublicKeyBindingError>
+where
+    R: EcdsaFpRing,
+{
+    let b1 = scalar_bits(&u1);
+    let b2 = scalar_bits(&u2);
+    let bits = core::array::from_fn(|row| (b1[row], b2[row]));
+    build_complete_trace(num_vars, q, bits)
+}
+
+#[cfg(test)]
+fn run_shamir(
+    q: &(CbUint<EC_FP_INT_LIMBS>, CbUint<EC_FP_INT_LIMBS>),
+    bits: &[(bool, bool); NUM_SHAMIR_ROUNDS],
+) -> Result<(ProjectivePoint, Vec<StepValues>), EcdsaPublicKeyBindingError> {
+    let g_plus_q = validate_public_key_uint(*q)?.g_plus_q;
+    let mut state = ProjectivePoint::identity();
+    let mut steps = Vec::with_capacity(NUM_SHAMIR_ROUNDS);
+    for &pair in bits {
+        let addend = select_addend(pair, q, &g_plus_q);
+        let step = compute_step(&state, &addend);
+        state = step.next.clone();
+        steps.push(step);
+    }
+    Ok((state, steps))
 }
 
 // ---------------------------------------------------------------------------
 // Witness generator.
 // ---------------------------------------------------------------------------
 
+fn build_complete_trace<R>(
+    num_vars: usize,
+    q: (CbUint<EC_FP_INT_LIMBS>, CbUint<EC_FP_INT_LIMBS>),
+    bits: [(bool, bool); NUM_SHAMIR_ROUNDS],
+) -> Result<UairTrace<'static, R, R, 32>, EcdsaPublicKeyBindingError>
+where
+    R: EcdsaFpRing,
+{
+    let n_rows = 1usize << num_vars;
+    assert!(
+        n_rows > FINAL_ROW,
+        "Shamir UAIR needs > {FINAL_ROW} rows; got {n_rows}",
+    );
+
+    let g_plus_q = validate_public_key_uint(q)?.g_plus_q;
+
+    let mut states = Vec::with_capacity(FINAL_ROW + 1);
+    let mut steps = Vec::with_capacity(NUM_SHAMIR_ROUNDS);
+    states.push(ProjectivePoint::identity());
+    for (row, &pair) in bits.iter().enumerate() {
+        let addend = select_addend(pair, &q, &g_plus_q);
+        let step = compute_step(&states[row], &addend);
+        states.push(step.next.clone());
+        steps.push(step);
+    }
+
+    let mut columns: Vec<Vec<R>> = (0..cols::NUM_INT).map(|_| vec![R::ZERO; n_rows]).collect();
+    columns[cols::S_INIT][0] = R::ONE;
+    columns[cols::S_FINAL][FINAL_ROW] = R::ONE;
+    columns[cols::PA_R_INIT_Y][0] = R::ONE;
+
+    for row in 0..NUM_SHAMIR_ROUNDS {
+        let (b1, b2) = bits[row];
+        let addend = select_addend((b1, b2), &q, &g_plus_q);
+        columns[cols::S_ACTIVE][row] = R::ONE;
+        columns[cols::S_ADD][row] = if b1 || b2 { R::ONE } else { R::ZERO };
+        columns[cols::PA_B1][row] = if b1 { R::ONE } else { R::ZERO };
+        columns[cols::PA_B2][row] = if b2 { R::ONE } else { R::ZERO };
+        columns[cols::PA_B1B2][row] = if b1 && b2 { R::ONE } else { R::ZERO };
+        columns[cols::PA_QX][row] = R::from(uint_to_int(q.0));
+        columns[cols::PA_QY][row] = R::from(uint_to_int(q.1));
+        columns[cols::PA_QGX][row] = R::from(uint_to_int(g_plus_q.0));
+        columns[cols::PA_QGY][row] = R::from(uint_to_int(g_plus_q.1));
+        columns[cols::PA_T_X][row] = R::from(uint_to_int(addend.x));
+        columns[cols::PA_T_Y][row] = R::from(uint_to_int(addend.y));
+
+        let state = &states[row];
+        columns[cols::W_X][row] = R::from(uint_to_int(state.x));
+        columns[cols::W_Y][row] = R::from(uint_to_int(state.y));
+        columns[cols::W_Z][row] = R::from(uint_to_int(state.z));
+
+        let step = &steps[row];
+        for (column, value) in [
+            (cols::W_D_T0, step.doubled_products[0]),
+            (cols::W_D_T1, step.doubled_products[1]),
+            (cols::W_D_T2, step.doubled_products[2]),
+            (cols::W_D_T3, step.doubled_products[3]),
+            (cols::W_D_T4, step.doubled_products[4]),
+            (cols::W_D_T5, step.doubled_products[5]),
+            (cols::W_A_T0, step.addition_products[0]),
+            (cols::W_A_T1, step.addition_products[1]),
+            (cols::W_A_T2, step.addition_products[2]),
+            (cols::W_A_T4, step.addition_products[4]),
+        ] {
+            columns[column][row] = R::from(uint_to_int(value));
+        }
+    }
+
+    let final_state = &states[FINAL_ROW];
+    columns[cols::W_X][FINAL_ROW] = R::from(uint_to_int(final_state.x));
+    columns[cols::W_Y][FINAL_ROW] = R::from(uint_to_int(final_state.y));
+    columns[cols::W_Z][FINAL_ROW] = R::from(uint_to_int(final_state.z));
+    let z_inv = inv_mod_p(&final_state.z);
+    columns[cols::PA_Z_INV][FINAL_ROW] = R::from(uint_to_int(z_inv));
+    columns[cols::PA_R_X][FINAL_ROW] = R::from(uint_to_int(mul_mod_p(&final_state.x, &z_inv)));
+
+    let int = columns
+        .into_iter()
+        .map(|column| column.into_iter().collect())
+        .collect::<Vec<DenseMultilinearExtension<R>>>();
+    Ok(UairTrace {
+        int: int.into(),
+        ..Default::default()
+    })
+}
+
 impl<R> GenerateRandomTrace<32> for EcdsaUair<R>
 where
-    R: EcdsaFpRing + From<Int<EC_FP_INT_LIMBS>>,
+    R: EcdsaFpRing,
 {
     type PolyCoeff = R;
     type Int = R;
@@ -656,168 +1130,16 @@ where
         num_vars: usize,
         rng: &mut Rng,
     ) -> UairTrace<'static, R, R, 32> {
-        let n_rows = 1usize << num_vars;
-        assert!(
-            n_rows > FINAL_ROW,
-            "Shamir UAIR needs > {FINAL_ROW} rows; got {n_rows}",
-        );
-
-        // Pick a non-identity initial point and a non-identity addend.
-        // The synthetic test exercises the new in-circuit addend selector
-        // by setting the bit pair to `(b_1, b_2) = (0, 1)` at every active
-        // row, which selects the Q public column as the row's addend.
-        // PA_QGX, PA_QGY (the (G+Q) coordinates) are populated with
-        // arbitrary values — they don't enter the constraint when
-        // (b_1, b_2) = (0, 1) since b_1 = 0 zeroes out the b_1·b_2·(G+Q)
-        // term, and the placeholder G_x / G_y scalars in `constrain_general`
-        // are zero so the b_1·G term also vanishes (consistent with b_1 = 0).
-        let r_init_x = rand_fp(rng);
-        let r_init_y = rand_fp(rng);
-        let r_init_z = rand_nonzero_fp(rng);
-        let pa_x = rand_fp(rng);
-        let pa_y = rand_fp(rng);
-        // Filler values for the `(G+Q)` public columns — never selected
-        // when bits are `(0, 1)`, but populated to keep the column shape
-        // consistent.
-        let qg_x = rand_fp(rng);
-        let qg_y = rand_fp(rng);
-
-        // Build the per-row state by simulating the Shamir loop.
-        // x_seq[t] = R_t. x_seq[0] = R_init.
-        let mut x_seq: Vec<CbUint<EC_FP_INT_LIMBS>> = Vec::with_capacity(n_rows);
-        let mut y_seq: Vec<CbUint<EC_FP_INT_LIMBS>> = Vec::with_capacity(n_rows);
-        let mut z_seq: Vec<CbUint<EC_FP_INT_LIMBS>> = Vec::with_capacity(n_rows);
-        x_seq.push(r_init_x.clone());
-        y_seq.push(r_init_y.clone());
-        z_seq.push(r_init_z.clone());
-
-        let mut steps: Vec<StepValues> = Vec::with_capacity(NUM_SHAMIR_ROUNDS);
-        for t in 0..NUM_SHAMIR_ROUNDS {
-            let step = compute_step(&x_seq[t], &y_seq[t], &z_seq[t], &pa_x, &pa_y, true);
-            x_seq.push(step.next_x.clone());
-            y_seq.push(step.next_y.clone());
-            z_seq.push(step.next_z.clone());
-            steps.push(step);
+        let mut bits = [(false, false); NUM_SHAMIR_ROUNDS];
+        for pair in &mut bits {
+            let random = rng.next_u32();
+            *pair = (random & 1 != 0, random & 2 != 0);
         }
-
-        // Pad the chained state sequence to n_rows.
-        let zero_uint = CbUint::<EC_FP_INT_LIMBS>::ZERO;
-        while x_seq.len() < n_rows {
-            x_seq.push(zero_uint.clone());
-            y_seq.push(zero_uint.clone());
-            z_seq.push(zero_uint.clone());
+        if bits.iter().all(|&(b1, b2)| !b1 && !b2) {
+            bits[NUM_SHAMIR_ROUNDS - 1] = (true, false);
         }
-
-        // ---- Populate columns. ----
-        let mk_col = || vec![R::ZERO; n_rows];
-
-        let mut s_init_col: Vec<R> = mk_col();
-        let mut s_active_col: Vec<R> = mk_col();
-        let mut s_final_col: Vec<R> = mk_col();
-        let mut s_add_col: Vec<R> = mk_col();
-        let mut pa_b1_col: Vec<R> = mk_col();
-        let mut pa_b2_col: Vec<R> = mk_col();
-        let mut pa_qx_col: Vec<R> = mk_col();
-        let mut pa_qy_col: Vec<R> = mk_col();
-        let mut pa_qgx_col: Vec<R> = mk_col();
-        let mut pa_qgy_col: Vec<R> = mk_col();
-        let mut pa_r_init_x_col: Vec<R> = mk_col();
-        let mut pa_r_init_y_col: Vec<R> = mk_col();
-        let mut pa_r_init_z_col: Vec<R> = mk_col();
-        let mut pa_z_inv_col: Vec<R> = mk_col();
-        let mut pa_r_x_col: Vec<R> = mk_col();
-        let mut x_col: Vec<R> = mk_col();
-        let mut y_col: Vec<R> = mk_col();
-        let mut z_col: Vec<R> = mk_col();
-        let mut x_pa_col: Vec<R> = mk_col();
-        let mut y_pa_col: Vec<R> = mk_col();
-        let mut z_pa_col: Vec<R> = mk_col();
-        let mut c_col: Vec<R> = mk_col();
-        let mut d_col: Vec<R> = mk_col();
-
-        // Selectors and bits. Q and G+Q are constant across rows.
-        // Bit pair (b_1, b_2) = (0, 1) at every active row → addend = Q,
-        // so S_ADD = b_1 + b_2 - b_1·b_2 = 0 + 1 - 0 = 1.
-        s_init_col[0] = R::ONE;
-        for t in 0..NUM_SHAMIR_ROUNDS {
-            s_active_col[t] = R::ONE;
-            s_add_col[t] = R::ONE;
-            pa_b1_col[t] = R::ZERO;
-            pa_b2_col[t] = R::ONE;
-            pa_qx_col[t] = R::from(uint_to_int(pa_x.clone()));
-            pa_qy_col[t] = R::from(uint_to_int(pa_y.clone()));
-            pa_qgx_col[t] = R::from(uint_to_int(qg_x.clone()));
-            pa_qgy_col[t] = R::from(uint_to_int(qg_y.clone()));
-        }
-        s_final_col[FINAL_ROW] = R::ONE;
-
-        // PA_R_INIT only matters at row 0 (gated by S_INIT).
-        pa_r_init_x_col[0] = R::from(uint_to_int(r_init_x));
-        pa_r_init_y_col[0] = R::from(uint_to_int(r_init_y));
-        pa_r_init_z_col[0] = R::from(uint_to_int(r_init_z));
-
-        // PA_Z_INV / PA_R_X only matter at FINAL_ROW (gated by
-        // S_FINAL): they encode the affine x-readout
-        //   Z_inv := P_Z[FINAL_ROW]^{-1} mod p,
-        //   R_x   := P_X[FINAL_ROW] · Z_inv^2 mod p.
-        // Constraints F1, F2 then pin (P_Z · Z_inv = 1) and
-        // (P_X · Z_inv^2 = R_x) at the final row.
-        let final_z = z_seq[FINAL_ROW].clone();
-        let final_x = x_seq[FINAL_ROW].clone();
-        let z_inv = inv_mod_p(&final_z);
-        let z_inv_sq = mul_mod_p(&z_inv, &z_inv);
-        let r_x = mul_mod_p(&final_x, &z_inv_sq);
-        pa_z_inv_col[FINAL_ROW] = R::from(uint_to_int(z_inv));
-        pa_r_x_col[FINAL_ROW] = R::from(uint_to_int(r_x));
-
-        // Chained state: X[t] = R_t.
-        for t in 0..n_rows {
-            x_col[t] = R::from(uint_to_int(x_seq[t].clone()));
-            y_col[t] = R::from(uint_to_int(y_seq[t].clone()));
-            z_col[t] = R::from(uint_to_int(z_seq[t].clone()));
-        }
-
-        // Per-step intermediates (rows 0..NUM_SHAMIR_ROUNDS).
-        for (t, step) in steps.iter().enumerate() {
-            x_pa_col[t] = R::from(uint_to_int(step.x_pa.clone()));
-            y_pa_col[t] = R::from(uint_to_int(step.y_pa.clone()));
-            z_pa_col[t] = R::from(uint_to_int(step.z_pa.clone()));
-            c_col[t] = R::from(uint_to_int(step.c.clone()));
-            d_col[t] = R::from(uint_to_int(step.d.clone()));
-        }
-
-        let to_mle = |col: Vec<R>| -> DenseMultilinearExtension<R> { col.into_iter().collect() };
-
-        let int = vec![
-            to_mle(s_init_col),
-            to_mle(s_active_col),
-            to_mle(s_final_col),
-            to_mle(s_add_col),
-            to_mle(pa_b1_col),
-            to_mle(pa_b2_col),
-            to_mle(pa_qx_col),
-            to_mle(pa_qy_col),
-            to_mle(pa_qgx_col),
-            to_mle(pa_qgy_col),
-            to_mle(pa_r_init_x_col),
-            to_mle(pa_r_init_y_col),
-            to_mle(pa_r_init_z_col),
-            to_mle(pa_z_inv_col),
-            to_mle(pa_r_x_col),
-            to_mle(x_col),
-            to_mle(y_col),
-            to_mle(z_col),
-            to_mle(x_pa_col),
-            to_mle(y_pa_col),
-            to_mle(z_pa_col),
-            to_mle(c_col),
-            to_mle(d_col),
-        ];
-
-        UairTrace {
-            int: int.into(),
-            ..Default::default()
-        }
+        build_complete_trace(num_vars, (SECP256K1_G_X_UINT, SECP256K1_G_Y_UINT), bits)
+            .expect("the generator public key is valid and G+G is affine")
     }
 }
 
@@ -828,110 +1150,455 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crypto_bigint::ConstOne;
     use rand::rng;
     use zinc_uair::{
         constraint_counter::count_constraints,
         degree_counter::{count_constraint_degrees, count_max_degree},
     };
 
-    /// Sanity: 13 constraints; max degree 7 — `S = Y²` is inlined.
-    /// Final-row affine readout is in-circuit via F1 (P_Z · Z_inv = 1)
-    /// and F2 (P_X · Z_inv² = R_x), gated by S_FINAL; the
-    /// `R_x ≡ r (mod n)` order-field check remains off-protocol.
-    /// Max degree 7 from C-A2 (the in-circuit affine addend `T_y` is
-    /// degree 3, multiplied by Z_pa³ deg 3 and S_ACTIVE deg 1).
+    fn int_to_uint(value: &Int<EC_FP_INT_LIMBS>) -> CbUint<EC_FP_INT_LIMBS> {
+        let raw = *value.inner().as_uint();
+        let is_negative = raw.as_words()[EC_FP_INT_LIMBS - 1] >> 63 != 0;
+        if is_negative {
+            raw.wrapping_add(&SECP256K1_P_UINT)
+        } else {
+            raw
+        }
+    }
+
+    fn read_uint(
+        trace: &UairTrace<'_, Int<EC_FP_INT_LIMBS>, Int<EC_FP_INT_LIMBS>, 32>,
+        column: usize,
+        row: usize,
+    ) -> CbUint<EC_FP_INT_LIMBS> {
+        int_to_uint(&trace.int[column][row])
+    }
+
+    fn uint(hex: &str) -> CbUint<EC_FP_INT_LIMBS> {
+        CbUint::from_be_hex(hex)
+    }
+
+    fn uint_to_be_bytes(value: &CbUint<EC_FP_INT_LIMBS>) -> [u8; 32] {
+        let mut bytes = [0_u8; 32];
+        for (index, word) in value.as_words().iter().rev().enumerate() {
+            bytes[index * 8..(index + 1) * 8].copy_from_slice(&word.to_be_bytes());
+        }
+        bytes
+    }
+
+    fn bits_from_scalars(
+        u1: CbUint<EC_FP_INT_LIMBS>,
+        u2: CbUint<EC_FP_INT_LIMBS>,
+    ) -> [(bool, bool); NUM_SHAMIR_ROUNDS] {
+        let b1 = scalar_bits(&u1);
+        let b2 = scalar_bits(&u2);
+        core::array::from_fn(|row| (b1[row], b2[row]))
+    }
+
     #[test]
     fn shamir_constraint_shape() {
         type U = EcdsaUair<Int<EC_FP_INT_LIMBS>>;
-        assert_eq!(count_constraints::<U>(), 13);
-        assert_eq!(count_max_degree::<U>(), 7);
+        assert_eq!(count_constraints::<U>(), 20);
+        assert_eq!(count_max_degree::<U>(), 5);
         let degrees = count_constraint_degrees::<U>();
-        // Spot-checks: at least one deg-7 (Y addend constraint); 3 init deg-2.
-        assert!(degrees.iter().any(|&d| d == 7), "expected at least one deg-7");
-        assert_eq!(degrees.iter().filter(|&&d| d == 2).count(), 3, "init = 3 deg-2");
+        assert!(degrees.iter().all(|&degree| degree <= 5));
+        assert_eq!(degrees.iter().filter(|&&degree| degree == 2).count(), 3);
     }
 
-    /// Witness gen produces a trace where every constraint vanishes
-    /// mod p. Exercises the active block + final affine conversion.
     #[test]
-    fn witness_satisfies_constraints_mod_p() {
+    fn witness_replays_complete_rcb_rows() {
         let num_vars = 9;
-        let mut r = rng();
-        let trace = <EcdsaUair<Int<EC_FP_INT_LIMBS>> as GenerateRandomTrace<32>>::
-            generate_random_trace(num_vars, &mut r);
-        let n_rows = 1 << num_vars;
+        let mut random = rng();
+        let trace =
+            <EcdsaUair<Int<EC_FP_INT_LIMBS>> as GenerateRandomTrace<32>>::generate_random_trace(
+                num_vars,
+                &mut random,
+            );
         assert_eq!(trace.int.len(), cols::NUM_INT);
+        verify_ecdsa_public_int_structure(&trace.int[..cols::NUM_INT_PUB], num_vars)
+            .expect("generated public structure must verify");
 
-        // Centered representation: see twin comment in
-        // `ecdsa_doubling.rs::tests`.
-        let int_to_uint = |v: &Int<EC_FP_INT_LIMBS>| -> CbUint<EC_FP_INT_LIMBS> {
-            let raw = *v.inner().as_uint();
-            let is_neg = raw.as_words()[EC_FP_INT_LIMBS - 1] >> 63 != 0;
-            if is_neg {
-                raw.wrapping_add(&SECP256K1_P_UINT)
-            } else {
-                raw
+        for row in 0..NUM_SHAMIR_ROUNDS {
+            let state = ProjectivePoint {
+                x: read_uint(&trace, cols::W_X, row),
+                y: read_uint(&trace, cols::W_Y, row),
+                z: read_uint(&trace, cols::W_Z, row),
+            };
+            let addend = ProjectivePoint {
+                x: read_uint(&trace, cols::PA_T_X, row),
+                y: read_uint(&trace, cols::PA_T_Y, row),
+                z: read_uint(&trace, cols::S_ADD, row),
+            };
+            let expected = compute_step(&state, &addend);
+            for (column, value) in [
+                (cols::W_D_T0, expected.doubled_products[0]),
+                (cols::W_D_T1, expected.doubled_products[1]),
+                (cols::W_D_T2, expected.doubled_products[2]),
+                (cols::W_D_T3, expected.doubled_products[3]),
+                (cols::W_D_T4, expected.doubled_products[4]),
+                (cols::W_D_T5, expected.doubled_products[5]),
+                (cols::W_A_T0, expected.addition_products[0]),
+                (cols::W_A_T1, expected.addition_products[1]),
+                (cols::W_A_T2, expected.addition_products[2]),
+                (cols::W_A_T4, expected.addition_products[4]),
+            ] {
+                assert_eq!(
+                    read_uint(&trace, column, row),
+                    value,
+                    "column {column}, row {row}"
+                );
             }
-        };
-        let read_uint = |c: usize, t: usize| int_to_uint(&trace.int[c][t]);
-        let zero_uint: CbUint<EC_FP_INT_LIMBS> = CbUint::ZERO;
+            assert_eq!(read_uint(&trace, cols::W_X, row + 1), expected.next.x);
+            assert_eq!(read_uint(&trace, cols::W_Y, row + 1), expected.next.y);
+            assert_eq!(read_uint(&trace, cols::W_Z, row + 1), expected.next.z);
+        }
+    }
 
-        for t in 0..n_rows {
-            let s_active_int = trace.int[cols::S_ACTIVE][t].clone();
-            let s_init_int = trace.int[cols::S_INIT][t].clone();
-            let s_final_int = trace.int[cols::S_FINAL][t].clone();
-            let active = s_active_int == Int::ONE;
-            let init = s_init_int == Int::ONE;
-            let final_row = s_final_int == Int::ONE;
+    #[test]
+    fn frozen_signature_matches_openssl_oracle() {
+        let q = (
+            uint("72d74be030e343fd313ab5af81b2f326e60f161778f0a555bd01baab27690558"),
+            uint("1cd8822e229ec716381f7db49e7515d5ca48ec52ec0acab0c8da943ea00c26b6"),
+        );
+        let bits = bits_from_scalars(
+            uint("30e48216899822d64bdb7f54db72055cef40f5d894433dc1af0251e69ac1a2f0"),
+            uint("968a5f9440aa6bb07e2a112cf0fdcd15c681c90ba2102d9dd633cc6dad0cd8f8"),
+        );
+        let (final_point, _) =
+            run_shamir(&q, &bits).expect("frozen public key must be valid");
+        let affine = projective_to_affine(&final_point).expect("fixture result is finite");
+        assert_eq!(
+            affine.0,
+            uint("12e2303536ccdd4f4fb63a8cbe473faa259c3b28b00c3f62ff095e9e90a21217")
+        );
+        assert_eq!(
+            affine.1,
+            uint("b0c26fdac74ffad75053a692649da3587f06bb03e90820645d421e0eda72ddbf")
+        );
 
-            // Active rows: doubling + addition intermediates +
-            // chained-output (= R_{t+1}).
-            if active {
-                let s_add_int = trace.int[cols::S_ADD][t].clone();
-                let s_add_bit = s_add_int == Int::ONE;
+        let trace = build_complete_trace::<Int<EC_FP_INT_LIMBS>>(9, q, bits)
+            .expect("fixture public key must be valid");
+        verify_ecdsa_public_int_structure(&trace.int[..cols::NUM_INT_PUB], 9)
+            .expect("fixture public structure must verify");
+        assert_eq!(read_uint(&trace, cols::PA_R_X, FINAL_ROW), affine.0);
+        let signature_r = uint_to_be_bytes(&affine.0);
+        assert_eq!(
+            verify_ecdsa_result_binding(&signature_r, &trace.int[cols::PA_R_X][FINAL_ROW]),
+            Ok(EcdsaResultBranch::Direct),
+        );
+    }
 
-                // The synthetic test uses bit pair (b_1, b_2) = (0, 1)
-                // at every active row, so the addend is Q = (PA_QX, PA_QY).
-                let pa_x = read_uint(cols::PA_QX, t);
-                let pa_y = read_uint(cols::PA_QY, t);
-                let x = read_uint(cols::W_X, t);
-                let y = read_uint(cols::W_Y, t);
-                let z = read_uint(cols::W_Z, t);
+    #[test]
+    fn result_binding_covers_both_possible_representatives() {
+        let r = CbUint::ONE;
+        let r_bytes = uint_to_be_bytes(&r);
+        assert_eq!(
+            verify_ecdsa_result_binding(&r_bytes, &uint_to_int(r)),
+            Ok(EcdsaResultBranch::Direct),
+        );
 
-                let expected = compute_step(&x, &y, &z, &pa_x, &pa_y, s_add_bit);
+        let r_plus_n = SECP256K1_N_UINT.wrapping_add(&r);
+        assert!(r_plus_n < SECP256K1_P_UINT);
+        assert_eq!(
+            verify_ecdsa_result_binding(&r_bytes, &uint_to_int(r_plus_n)),
+            Ok(EcdsaResultBranch::PlusOrder),
+        );
+    }
 
-                assert_eq!(read_uint(cols::W_X_PA, t), expected.x_pa, "X_pa at row {t}");
-                assert_eq!(read_uint(cols::W_Y_PA, t), expected.y_pa, "Y_pa at row {t}");
-                assert_eq!(read_uint(cols::W_Z_PA, t), expected.z_pa, "Z_pa at row {t}");
-                assert_eq!(read_uint(cols::W_C, t), expected.c, "C at row {t}");
-                assert_eq!(read_uint(cols::W_D, t), expected.d, "D at row {t}");
+    #[test]
+    fn result_binding_covers_order_and_field_boundaries() {
+        let largest_scalar = SECP256K1_N_UINT.wrapping_sub(&CbUint::ONE);
+        assert_eq!(
+            verify_ecdsa_result_binding(
+                &uint_to_be_bytes(&largest_scalar),
+                &uint_to_int(largest_scalar),
+            ),
+            Ok(EcdsaResultBranch::Direct),
+        );
 
-                // Output: down.X = next R = expected.next_x.
-                if t + 1 < n_rows {
-                    assert_eq!(read_uint(cols::W_X, t + 1), expected.next_x, "next X at {t}");
-                    assert_eq!(read_uint(cols::W_Y, t + 1), expected.next_y, "next Y at {t}");
-                    assert_eq!(read_uint(cols::W_Z, t + 1), expected.next_z, "next Z at {t}");
-                }
-            }
+        let largest_x = SECP256K1_P_UINT.wrapping_sub(&CbUint::ONE);
+        let largest_x_reduced = largest_x.wrapping_sub(&SECP256K1_N_UINT);
+        assert_eq!(
+            verify_ecdsa_result_binding(
+                &uint_to_be_bytes(&largest_x_reduced),
+                &uint_to_int(largest_x),
+            ),
+            Ok(EcdsaResultBranch::PlusOrder),
+        );
 
-            // Init boundary: row 0's R = PA_R_INIT.
-            if init {
-                assert_eq!(read_uint(cols::W_X, t), read_uint(cols::PA_R_INIT_X, t), "init X at {t}");
-                assert_eq!(read_uint(cols::W_Y, t), read_uint(cols::PA_R_INIT_Y, t), "init Y at {t}");
-                assert_eq!(read_uint(cols::W_Z, t), read_uint(cols::PA_R_INIT_Z, t), "init Z at {t}");
-            }
+        // x = n reduces to zero and therefore cannot equal any canonical
+        // nonzero ECDSA r. This pins the branch boundary itself.
+        assert_eq!(
+            verify_ecdsa_result_binding(
+                &uint_to_be_bytes(&CbUint::ONE),
+                &uint_to_int(SECP256K1_N_UINT),
+            ),
+            Err(EcdsaResultBindingError::ResultMismatch),
+        );
+    }
 
-            // Final-row check: no in-circuit constraint after dropping
-            // F1; the affine readout is handled off-protocol. We still
-            // skip the padding-zero check at FINAL_ROW because that row
-            // holds R_NUM_SHAMIR_ROUNDS, the chained final state.
+    #[test]
+    fn result_binding_rejects_scalar_range_and_encoding_errors() {
+        let x = uint_to_int(CbUint::ONE);
+        assert_eq!(
+            verify_ecdsa_result_binding(&[0_u8; 31], &x),
+            Err(EcdsaResultBindingError::SignatureScalarEncoding {
+                actual_bytes: 31
+            }),
+        );
+        assert_eq!(
+            verify_ecdsa_result_binding(&[0_u8; 33], &x),
+            Err(EcdsaResultBindingError::SignatureScalarEncoding {
+                actual_bytes: 33
+            }),
+        );
+        assert_eq!(
+            verify_ecdsa_result_binding(&[0_u8; 32], &x),
+            Err(EcdsaResultBindingError::SignatureScalarZero),
+        );
+        assert_eq!(
+            verify_ecdsa_result_binding(&uint_to_be_bytes(&SECP256K1_N_UINT), &x),
+            Err(EcdsaResultBindingError::SignatureScalarOutOfRange),
+        );
+    }
 
-            // Padding rows past FINAL_ROW: chained X is zero
-            // (uninitialized but unconstrained).
-            if !active && !final_row {
-                assert_eq!(read_uint(cols::W_X, t), zero_uint, "pad X at {t}");
+    #[test]
+    fn public_key_validation_matches_frozen_libsecp_oracle() {
+        let q = (
+            uint("c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5"),
+            uint("1ae168fea63dc339a3c58419466ceaeef7f632653266d0e1236431a950cfe52a"),
+        );
+        let bound = validate_secp256k1_public_key(&uint_to_be_bytes(&q.0), &uint_to_be_bytes(&q.1))
+            .expect("2G must be a valid public key");
+        assert_eq!(bound.q, q);
+        assert_eq!(
+            bound.g_plus_q,
+            (
+                uint("f9308a019258c31049344f85f89d5229b531c845836f99b08601f113bce036f9"),
+                uint("388f7b0f632de8140fe337e62a37f3566500a99934c2231b6cb9fd7584b8e672"),
+            ),
+        );
+
+        let doubled = validate_secp256k1_public_key(
+            &uint_to_be_bytes(&SECP256K1_G_X_UINT),
+            &uint_to_be_bytes(&SECP256K1_G_Y_UINT),
+        )
+        .expect("Q=G must use complete doubling");
+        assert_eq!(doubled.g_plus_q, q);
+    }
+
+    #[test]
+    fn public_key_validation_rejects_every_affine_boundary() {
+        let generator_x = uint_to_be_bytes(&SECP256K1_G_X_UINT);
+        let generator_y = uint_to_be_bytes(&SECP256K1_G_Y_UINT);
+        assert_eq!(
+            validate_secp256k1_public_key(&generator_x[..31], &generator_y),
+            Err(EcdsaPublicKeyBindingError::CoordinateEncoding {
+                coordinate: EcdsaCoordinate::X,
+                actual_bytes: 31,
+            }),
+        );
+        assert_eq!(
+            validate_secp256k1_public_key(&generator_x, &generator_y[..31]),
+            Err(EcdsaPublicKeyBindingError::CoordinateEncoding {
+                coordinate: EcdsaCoordinate::Y,
+                actual_bytes: 31,
+            }),
+        );
+        assert_eq!(
+            validate_secp256k1_public_key(&uint_to_be_bytes(&SECP256K1_P_UINT), &generator_y),
+            Err(EcdsaPublicKeyBindingError::CoordinateOutOfRange {
+                coordinate: EcdsaCoordinate::X,
+            }),
+        );
+        assert_eq!(
+            validate_secp256k1_public_key(&generator_x, &uint_to_be_bytes(&SECP256K1_P_UINT)),
+            Err(EcdsaPublicKeyBindingError::CoordinateOutOfRange {
+                coordinate: EcdsaCoordinate::Y,
+            }),
+        );
+        let off_curve_y = SECP256K1_G_Y_UINT.wrapping_add(&CbUint::ONE);
+        assert_eq!(
+            validate_secp256k1_public_key(&generator_x, &uint_to_be_bytes(&off_curve_y)),
+            Err(EcdsaPublicKeyBindingError::PointNotOnCurve),
+        );
+        assert_eq!(
+            validate_secp256k1_public_key(&[0_u8; 32], &[0_u8; 32]),
+            Err(EcdsaPublicKeyBindingError::PointNotOnCurve),
+        );
+        let minus_g_y = SECP256K1_P_UINT.wrapping_sub(&SECP256K1_G_Y_UINT);
+        assert_eq!(
+            validate_secp256k1_public_key(&generator_x, &uint_to_be_bytes(&minus_g_y)),
+            Err(EcdsaPublicKeyBindingError::GeneratorSumAtInfinity),
+        );
+        assert!(matches!(
+            build_trace_from_scalars::<Int<EC_FP_INT_LIMBS>>(
+                9,
+                (SECP256K1_G_X_UINT, minus_g_y),
+                CbUint::ONE,
+                CbUint::ONE,
+            ),
+            Err(EcdsaPublicKeyBindingError::GeneratorSumAtInfinity),
+        ));
+    }
+
+    #[test]
+    fn public_key_binding_owns_every_active_trace_cell() {
+        let q = (
+            uint("c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5"),
+            uint("1ae168fea63dc339a3c58419466ceaeef7f632653266d0e1236431a950cfe52a"),
+        );
+        let trace = build_trace_from_scalars::<Int<EC_FP_INT_LIMBS>>(
+            9,
+            q,
+            CbUint::ONE,
+            CbUint::ONE,
+        )
+        .expect("2G trace must build");
+        let public = &trace.int[..cols::NUM_INT_PUB];
+        verify_ecdsa_public_key_binding_in_columns(
+            &uint_to_be_bytes(&q.0),
+            &uint_to_be_bytes(&q.1),
+            public,
+            [cols::PA_QX, cols::PA_QY, cols::PA_QGX, cols::PA_QGY],
+        )
+        .expect("honest Q/G+Q columns must bind");
+
+        for column in [cols::PA_QX, cols::PA_QY, cols::PA_QGX, cols::PA_QGY] {
+            for row in 0..NUM_SHAMIR_ROUNDS {
+                let mut mutated = public.to_vec();
+                mutated[column].evaluations[row] = Int::from(0_u32);
+                assert_eq!(
+                    verify_ecdsa_public_key_binding_in_columns(
+                        &uint_to_be_bytes(&q.0),
+                        &uint_to_be_bytes(&q.1),
+                        &mutated,
+                        [cols::PA_QX, cols::PA_QY, cols::PA_QGX, cols::PA_QGY],
+                    ),
+                    Err(EcdsaPublicKeyBindingError::PublicPointMismatch { column, row }),
+                );
             }
         }
+
+        let mut noncanonical = public.to_vec();
+        let upper = SECP256K1_P_HALF_UINT.wrapping_add(&CbUint::ONE);
+        noncanonical[cols::PA_QX].evaluations[0] = Int::new(*upper.as_int());
+        assert_eq!(
+            verify_ecdsa_public_key_binding_in_columns(
+                &uint_to_be_bytes(&q.0),
+                &uint_to_be_bytes(&q.1),
+                &noncanonical,
+                [cols::PA_QX, cols::PA_QY, cols::PA_QGX, cols::PA_QGY],
+            ),
+            Err(EcdsaPublicKeyBindingError::NonCanonicalPublicPoint {
+                column: cols::PA_QX,
+                row: 0,
+            }),
+        );
+    }
+
+    #[test]
+    fn result_binding_rejects_noncanonical_centered_encodings() {
+        let upper = SECP256K1_P_HALF_UINT.wrapping_add(&CbUint::ONE);
+        assert_eq!(decode_canonical_final_x(&uint_to_int(upper)), Ok(upper));
+
+        let noncanonical_positive = Int::new(*upper.as_int());
+        assert_eq!(
+            decode_canonical_final_x(&noncanonical_positive),
+            Err(EcdsaResultBindingError::NonCanonicalFinalX),
+        );
+
+        let lower = SECP256K1_P_HALF_UINT;
+        let noncanonical_negative =
+            Int::new(*lower.wrapping_sub(&SECP256K1_P_UINT).as_int());
+        assert_eq!(
+            decode_canonical_final_x(&noncanonical_negative),
+            Err(EcdsaResultBindingError::NonCanonicalFinalX),
+        );
+        assert_eq!(decode_canonical_final_x(&uint_to_int(lower)), Ok(lower));
+    }
+
+    #[test]
+    fn exact_integer_check_rejects_fp_wraparound() {
+        let r = SECP256K1_P_UINT
+            .wrapping_sub(&SECP256K1_N_UINT)
+            .wrapping_add(&CbUint::ONE);
+        assert!(r > CbUint::ZERO && r < SECP256K1_N_UINT);
+        let final_x = CbUint::ONE;
+
+        // A bare F_p quotient equation with q=1 accepts this tuple because
+        // final_x - r - n = -p. The exact integer reduction must reject it.
+        assert_eq!(
+            sub_mod_p(&sub_mod_p(&final_x, &r), &SECP256K1_N_UINT),
+            CbUint::ZERO,
+        );
+        assert_eq!(
+            verify_ecdsa_result_binding(&uint_to_be_bytes(&r), &uint_to_int(final_x)),
+            Err(EcdsaResultBindingError::ResultMismatch),
+        );
+    }
+
+    #[test]
+    fn result_binding_rejects_missing_public_cell() {
+        assert_eq!(
+            verify_ecdsa_result_binding_in_column(&[1_u8; 32], &[], cols::PA_R_X),
+            Err(EcdsaResultBindingError::MissingPublicResult {
+                column: cols::PA_R_X,
+                row: FINAL_ROW,
+            }),
+        );
+    }
+
+    #[test]
+    fn complete_formulas_cover_full_chain_exceptions() {
+        let half_g = (
+            uint("00000000000000000000003b78ce563f89a0ed9414f5aa28ad0d96d6795f9c63"),
+            uint("c0c686408d517dfd67c2367651380d00d126e4229631fd03f8ff35eef1a61e3c"),
+        );
+        let minus_half_g = (
+            half_g.0,
+            uint("3f3979bf72ae8202983dc989aec7f2ff2ed91bdd69ce02fc0700ca100e59ddf3"),
+        );
+
+        let equal_bits = bits_from_scalars(CbUint::from_u64(1), CbUint::from_u64(2));
+        let (equal_result, _) =
+            run_shamir(&half_g, &equal_bits).expect("half-generator public key must be valid");
+        assert_eq!(
+            projective_to_affine(&equal_result),
+            Some((
+                uint("c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5"),
+                uint("1ae168fea63dc339a3c58419466ceaeef7f632653266d0e1236431a950cfe52a"),
+            ))
+        );
+
+        let restart_bits = bits_from_scalars(CbUint::from_u64(3), CbUint::from_u64(4));
+        let (restart_result, _) = run_shamir(&minus_half_g, &restart_bits)
+            .expect("minus-half-generator public key must be valid");
+        assert_eq!(
+            projective_to_affine(&restart_result),
+            Some((SECP256K1_G_X_UINT, SECP256K1_G_Y_UINT))
+        );
+    }
+
+    #[test]
+    fn public_structure_rejects_non_boolean_selector() {
+        let bits = [(false, true); NUM_SHAMIR_ROUNDS];
+        let trace = build_complete_trace::<Int<EC_FP_INT_LIMBS>>(
+            9,
+            (SECP256K1_G_X_UINT, SECP256K1_G_Y_UINT),
+            bits,
+        )
+        .expect("generator public key must be valid");
+        let mut public = trace.int[..cols::NUM_INT_PUB].to_vec();
+        public[cols::PA_B1].evaluations[17] = Int::from(2_u32);
+        let error = verify_ecdsa_public_int_structure(&public, 9)
+            .expect_err("non-boolean bit must be rejected");
+        assert!(matches!(
+            error,
+            PublicStructureError::WrongValue {
+                column: "PA_B1",
+                row: 17
+            }
+        ));
     }
 }

@@ -986,7 +986,7 @@ impl<IdealOverF: Ideal> VerifierPcsVerified<IdealOverF> {
 impl<Zt, U, F, const D: usize> ZincPlusPiop<Zt, U, F, D>
 where
     Zt: ZincTypes<D>,
-    Zt::Int: ProjectableToField<F> + num_traits::Zero,
+    Zt::Int: ProjectableToField<F> + num_traits::Zero + num_traits::One,
     <Zt::BinaryZt as ZipTypes>::Cw: ProjectableToField<F>,
     <Zt::ArbitraryZt as ZipTypes>::Eval: ProjectableToField<F>,
     <Zt::ArbitraryZt as ZipTypes>::Cw: ProjectableToField<F>,
@@ -1091,7 +1091,7 @@ pub fn verify_folded<
 ) -> Result<(), ProtocolError<F, IdealOverF>>
 where
     ZtF: crate::FoldedZincTypes<D, HALF_D>,
-    ZtF::Int: ProjectableToField<F> + num_traits::Zero,
+    ZtF::Int: ProjectableToField<F> + num_traits::Zero + num_traits::One,
     <ZtF::ArbitraryZt as ZipTypes>::Eval: ProjectableToField<F>,
     <ZtF::BinaryZt as ZipTypes>::Cw: ProjectableToField<F>,
     <ZtF::ArbitraryZt as ZipTypes>::Cw: ProjectableToField<F>,

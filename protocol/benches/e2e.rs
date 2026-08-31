@@ -4,31 +4,39 @@ use criterion::{
     BatchSize, BenchmarkGroup, BenchmarkId, Criterion, criterion_group, criterion_main,
     measurement::WallTime,
 };
-use crypto_bigint::U64;
+use crypto_bigint::{NonZero, U64, Uint as CbUint};
 use crypto_primitives::{
     ConstIntRing, ConstIntSemiring, Field, FixedSemiring, FromWithConfig, PrimeField,
     crypto_bigint_int::Int, crypto_bigint_monty::MontyField, crypto_bigint_uint::Uint,
 };
-use rand::rng;
+use rand::{SeedableRng, rng, rngs::StdRng};
 use std::{fmt::Debug, hint::black_box, marker::PhantomData, ops::Neg};
 use zinc_poly::{
     ConstCoeffBitWidth, Polynomial,
     univariate::{
         binary::{BinaryPoly, BinaryPolyInnerProduct},
         dense::{DensePolyInnerProduct, DensePolynomial},
-        dynamic::over_field::DynamicPolynomialF,
+        dynamic::over_field::{DynamicPolyVecF, DynamicPolynomialF},
     },
 };
 use zinc_primality::{MillerRabin, PrimalityTest};
-use zinc_protocol::{
-    FoldedZincTypes, IntFoldedZincTypes4x, Proof, ZincPlusPiop, ZincTypes,
-};
+use zinc_protocol::{FoldedZincTypes, IntFoldedZincTypes4x, Proof, ZincPlusPiop, ZincTypes};
 use zinc_test_uair::{
     BigLinearUair, BigLinearUairWithPublicInput, BinaryDecompositionUair, EC_FP_INT_LIMBS,
     EcdsaUair, GenerateRandomTrace, Sha256CompressionSliceUair, Sha256Ideal, ShaEcdsaUair,
-    ShaProxy, TestUairNoMultiplication,
+    ShaProxy, TestUairNoMultiplication, sha256,
+    ecdsa::{
+        SECP256K1_N_UINT, verify_ecdsa_public_key_binding_in_columns,
+        verify_ecdsa_result_binding,
+    },
+    ecdsa_doubling::{SECP256K1_G_X_UINT, SECP256K1_G_Y_UINT, SECP256K1_P_UINT},
+    sha_ecdsa::{
+        build_trace_from_message_and_signature, build_trace_from_sha_and_signature,
+        cols as sha_ecdsa_cols, derive_ecdsa_verification_scalars, extract_sha256_output,
+        verify_sha_ecdsa_application_binding, verify_sha_ecdsa_h8_application_binding,
+        verify_sha_ecdsa_honest_sha_binding, verify_sha_ecdsa_scalar_binding,
+    },
 };
-use zinc_poly::univariate::dynamic::over_field::DynamicPolyVecF;
 use zinc_transcript::traits::{ConstTranscribable, Transcribable};
 use zinc_uair::{
     Uair, UairTrace,
@@ -187,20 +195,8 @@ struct GenericBenchZincTypes<
     )>,
 );
 
-impl<Int, CwR, Chal, Pt, BinaryCombR, CombR, IntCombR, Fmod, PrimeTest, const D: usize>
-    ZincTypes<D>
-    for GenericBenchZincTypes<
-        Int,
-        CwR,
-        Chal,
-        Pt,
-        BinaryCombR,
-        CombR,
-        IntCombR,
-        Fmod,
-        PrimeTest,
-        D,
-    >
+impl<Int, CwR, Chal, Pt, BinaryCombR, CombR, IntCombR, Fmod, PrimeTest, const D: usize> ZincTypes<D>
+    for GenericBenchZincTypes<Int, CwR, Chal, Pt, BinaryCombR, CombR, IntCombR, Fmod, PrimeTest, D>
 where
     Int: ConstIntSemiring
         + for<'a> MulByScalar<&'a i64, CwR>
@@ -377,7 +373,7 @@ fn setup_pp(num_vars: usize) -> Pp<BenchZincTypes> {
 //
 // Real-UAIR bench types — wired for the EcdsaUair / Sha256CompressionSliceUair
 // / ShaEcdsaUair ports from main-gamma. Cell type is `Int<EC_FP_INT_LIMBS>`
-// (= `Int<5>`, 320-bit); CwR and CombR scale 2× and 4× respectively. F is
+// (`Int<4>`, 256-bit); CwR and CombR scale 2× and 4× respectively. F is
 // shared with `BenchZincTypes` (256-bit MontyField, holds the secp256k1
 // base prime used by `fixed_prime::secp256k1_field_cfg`).
 //
@@ -451,7 +447,7 @@ fn do_bench_e2e<Zt, U, IdealOverF>(
     project_ideal: impl Fn(&IdealOrZero<U::Ideal>, &<F as PrimeField>::Config) -> IdealOverF + Copy,
 ) where
     Zt: ZincTypes<DEGREE_PLUS_ONE>,
-    Zt::Int: ProjectableToField<F> + num_traits::Zero,
+    Zt::Int: ProjectableToField<F> + num_traits::Zero + num_traits::One,
     <Zt::BinaryZt as ZipTypes>::Cw: ProjectableToField<F>,
     <Zt::ArbitraryZt as ZipTypes>::Eval: ProjectableToField<F>,
     <Zt::ArbitraryZt as ZipTypes>::Cw: ProjectableToField<F>,
@@ -832,7 +828,7 @@ where
 // Real-UAIR benches (ECDSA / SHA-256 / SHA+ECDSA from main-gamma).
 //
 // Each pair (`_e2e` and `_steps`) delegates to the generic `do_bench_e2e` /
-// `do_bench_steps` helpers above with `RealEcdsaBenchZincTypes` (Int<5>),
+// `do_bench_steps` helpers above with `RealEcdsaBenchZincTypes` (`Int<4>`),
 // matching the eight-step taxonomy used by every other bench in this file.
 //
 
@@ -843,9 +839,8 @@ fn bench_real_ecdsa_e2e(group: &mut BenchmarkGroup<WallTime>, num_vars: usize) {
     let trace = U::generate_random_trace(num_vars, &mut rng);
     let pp = setup_pp_real_ecdsa(num_vars);
 
-    let proj_ideal = |_: &IdealOrZero<<U as Uair>::Ideal>,
-                      _: &<F as PrimeField>::Config|
-     -> ImpossibleIdeal {
+    let proj_ideal =
+        |_: &IdealOrZero<<U as Uair>::Ideal>, _: &<F as PrimeField>::Config| -> ImpossibleIdeal {
         unreachable!("EcdsaUair has only assert_zero constraints")
     };
 
@@ -867,9 +862,8 @@ fn bench_real_ecdsa_steps(group: &mut BenchmarkGroup<WallTime>, num_vars: usize)
     let trace = U::generate_random_trace(num_vars, &mut rng);
     let pp = setup_pp_real_ecdsa(num_vars);
 
-    let proj_ideal = |_: &IdealOrZero<<U as Uair>::Ideal>,
-                      _: &<F as PrimeField>::Config|
-     -> ImpossibleIdeal {
+    let proj_ideal =
+        |_: &IdealOrZero<<U as Uair>::Ideal>, _: &<F as PrimeField>::Config| -> ImpossibleIdeal {
         unreachable!("EcdsaUair has only assert_zero constraints")
     };
 
@@ -1114,7 +1108,7 @@ fn do_bench_e2e_folded<ZtF, U, IdealOverF>(
     project_ideal: impl Fn(&IdealOrZero<U::Ideal>, &<F as PrimeField>::Config) -> IdealOverF + Copy,
 ) where
     ZtF: FoldedZincTypes<DEGREE_PLUS_ONE, HALF_DEGREE_PLUS_ONE>,
-    ZtF::Int: ProjectableToField<F> + num_traits::Zero,
+    ZtF::Int: ProjectableToField<F> + num_traits::Zero + num_traits::One,
     <ZtF::ArbitraryZt as ZipTypes>::Eval: ProjectableToField<F>,
     <ZtF::BinaryZt as ZipTypes>::Cw: ProjectableToField<F>,
     <ZtF::ArbitraryZt as ZipTypes>::Cw: ProjectableToField<F>,
@@ -1225,7 +1219,6 @@ type FoldedPp4x<ZtF> = (
     >,
 );
 
-
 /// 4× folded e2e bench: routes binary AND int through `MultiZip3` for
 /// shared-Merkle collapse, then opens at the doubly-extended point
 /// `(r_0 ‖ γ₁ ‖ γ₂)`. Calls [`prove_folded_4x`] / [`verify_folded_4x`].
@@ -1318,14 +1311,11 @@ fn do_bench_e2e_folded_4x<ZtF, U, IdealOverF>(
     let sig = U::signature();
     let public_trace = trace.public(&sig);
 
-    group.bench_function(
-        BenchmarkId::new("Verify (folded 4×)", &params),
-        |bench| {
+    group.bench_function(BenchmarkId::new("Verify (folded 4×)", &params), |bench| {
             bench.iter_batched(
                 || proof.clone(),
                 |proof| {
-                    black_box(
-                        zinc_protocol::verifier::verify_folded_4x::<
+                black_box(zinc_protocol::verifier::verify_folded_4x::<
                             ZtF,
                             U,
                             F,
@@ -1343,14 +1333,12 @@ fn do_bench_e2e_folded_4x<ZtF, U, IdealOverF>(
                             num_vars,
                             project_scalar,
                             project_ideal,
-                        ),
-                    )
+                ))
                     .expect("Folded 4× verifier failed");
                 },
                 BatchSize::SmallInput,
             );
-        },
-    );
+    });
 
     let label_full = format!("Folded 4×/{params}");
     eprint_proof_size(&label_full, &proof);
@@ -1440,7 +1428,7 @@ fn eprint_folded_4x_per_region_prove_timings<ZtF, U, S, const MLE_FIRST: bool>(
         > + 'static,
     S: Fn(&U::Scalar, &<F as PrimeField>::Config) -> DynamicPolynomialF<F> + Copy + Sync,
 {
-    use zinc_protocol::prover::{prove_folded_4x_with_timings, FoldedProveTimings};
+    use zinc_protocol::prover::{FoldedProveTimings, prove_folded_4x_with_timings};
 
     const N: u32 = 100;
 
@@ -1584,9 +1572,7 @@ fn eprint_folded_4x_per_region_verify_timings<ZtF, U, IdealOverF, S, I>(
     S: Fn(&U::Scalar, &<F as PrimeField>::Config) -> DynamicPolynomialF<F> + Copy + Sync,
     I: Fn(&IdealOrZero<U::Ideal>, &<F as PrimeField>::Config) -> IdealOverF + Copy,
 {
-    use zinc_protocol::verifier::{
-        verify_folded_4x_with_timings, FoldedVerifyTimings,
-    };
+    use zinc_protocol::verifier::{FoldedVerifyTimings, verify_folded_4x_with_timings};
 
     const N: u32 = 100;
 
@@ -1689,7 +1675,6 @@ fn eprint_folded_4x_per_region_verify_timings<ZtF, U, IdealOverF, S, I>(
     );
 }
 
-
 /// Serialize each `Proof<F>` component into its own byte buffer and report
 /// per-part raw + zstd-compressed sizes, so we can see how much each part
 /// of the proof contributes to the total size. Sizes match the per-field
@@ -1709,8 +1694,9 @@ where
     }
 
     // 3 commitments concatenated (each ConstTranscribable, no length prefix).
-    let mut commits =
-        Vec::with_capacity(3_usize.saturating_mul(<ZipPlusCommitment as ConstTranscribable>::NUM_BYTES));
+    let mut commits = Vec::with_capacity(
+        3_usize.saturating_mul(<ZipPlusCommitment as ConstTranscribable>::NUM_BYTES),
+    );
     commits.extend_from_slice(&to_bytes(&proof.commitments.0));
     commits.extend_from_slice(&to_bytes(&proof.commitments.1));
     commits.extend_from_slice(&to_bytes(&proof.commitments.2));
@@ -1883,12 +1869,10 @@ fn eprint_folded_4x_zip_substep_breakdown<F>(
     );
 }
 
-
-
 //
 // Real-UAIR folded benches (1× and 4×). These reuse the generic
 // `do_bench_e2e_folded` / `do_bench_e2e_folded_4x` helpers above with
-// folded Zinc-types instances that pin `Int = RealEcdsaInt` (Int<5>) and
+// folded Zinc-types instances that pin `Int = RealEcdsaInt` (`Int<4>`) and
 // reuse the arbitrary/int Zip-types from `RealEcdsaBenchZincTypes`.
 //
 
@@ -1912,13 +1896,7 @@ impl FoldedZincTypes<DEGREE_PLUS_ONE, HALF_DEGREE_PLUS_ONE> for BenchFoldedRealE
         Int<5>,
         DensePolynomial<Int<5>, HALF_DEGREE_PLUS_ONE>,
         BinaryPolyInnerProduct<Self::Chal, HALF_DEGREE_PLUS_ONE>,
-        DensePolyInnerProduct<
-            Int<5>,
-            Self::Chal,
-            Int<5>,
-            MBSInnerProduct,
-            HALF_DEGREE_PLUS_ONE,
-        >,
+        DensePolyInnerProduct<Int<5>, Self::Chal, Int<5>, MBSInnerProduct, HALF_DEGREE_PLUS_ONE>,
         MBSInnerProduct,
     >;
 
@@ -1929,7 +1907,6 @@ impl FoldedZincTypes<DEGREE_PLUS_ONE, HALF_DEGREE_PLUS_ONE> for BenchFoldedRealE
     type ArbitraryLc = <RealEcdsaBenchZincTypes as ZincTypes<DEGREE_PLUS_ONE>>::ArbitraryLc;
     type IntLc = <RealEcdsaBenchZincTypes as ZincTypes<DEGREE_PLUS_ONE>>::IntLc;
 }
-
 
 //
 // 4× int-fold variant of the bench Zinc-types. Implements
@@ -1998,13 +1975,7 @@ impl
         Int<5>,
         DensePolynomial<Int<5>, QUARTER_DEGREE_PLUS_ONE>,
         BinaryPolyInnerProduct<Self::Chal, QUARTER_DEGREE_PLUS_ONE>,
-        DensePolyInnerProduct<
-            Int<5>,
-            Self::Chal,
-            Int<5>,
-            MBSInnerProduct,
-            QUARTER_DEGREE_PLUS_ONE,
-        >,
+        DensePolyInnerProduct<Int<5>, Self::Chal, Int<5>, MBSInnerProduct, QUARTER_DEGREE_PLUS_ONE>,
         MBSInnerProduct,
     >;
     type ArbitraryZt = <RealEcdsaBenchZincTypes as ZincTypes<DEGREE_PLUS_ONE>>::ArbitraryZt;
@@ -2089,9 +2060,8 @@ fn bench_real_ecdsa_e2e_folded(group: &mut BenchmarkGroup<WallTime>, num_vars: u
     let trace = U::generate_random_trace(num_vars, &mut rng);
     let pp = setup_folded_pp_real_ecdsa(num_vars);
 
-    let proj_ideal = |_: &IdealOrZero<<U as Uair>::Ideal>,
-                      _: &<F as PrimeField>::Config|
-     -> ImpossibleIdeal {
+    let proj_ideal =
+        |_: &IdealOrZero<<U as Uair>::Ideal>, _: &<F as PrimeField>::Config| -> ImpossibleIdeal {
         unreachable!("EcdsaUair has only assert_zero constraints")
     };
 
@@ -2142,14 +2112,10 @@ fn bench_real_sha_ecdsa_e2e_folded(group: &mut BenchmarkGroup<WallTime>, num_var
     );
 }
 
-
 /// ShaEcdsa 4× folded: binary AND int both quartered
 /// (BinaryPoly<8> / Int<2>) and committed under one Merkle tree
 /// via `MultiZip3`. One Merkle path per opening instead of three.
-fn bench_real_sha_ecdsa_e2e_folded_4x(
-    group: &mut BenchmarkGroup<WallTime>,
-    num_vars: usize,
-) {
+fn bench_real_sha_ecdsa_e2e_folded_4x(group: &mut BenchmarkGroup<WallTime>, num_vars: usize) {
     type U = ShaEcdsaUair<RealEcdsaInt>;
 
     let mut rng = rng();
@@ -2200,9 +2166,229 @@ fn e2e_folded_4x_benches(c: &mut Criterion) {
     print_peak_rss("Zinc+ E2E Folded 4x");
 }
 
-/// Prints peak resident-set-size of the bench process via `getrusage(RUSAGE_SELF)`.
-/// `ru_maxrss` is monotonic across the process lifetime, so the value reflects
-/// the peak observed across every bench that has run so far in this process.
+fn ecdsa_result_binding_benches(c: &mut Criterion) {
+    let mut group = c.benchmark_group("ECDSA Result Binding");
+
+    // Exercise the reduction branch: x = r + n, encoded in the same
+    // centered form used by the public integer trace.
+    let mut signature_r = [0_u8; 32];
+    signature_r[31] = 1;
+    let direct_final_x = Int::from(1_u32);
+    let representative = SECP256K1_N_UINT.wrapping_add(&CbUint::ONE);
+    let centered = representative.wrapping_sub(&SECP256K1_P_UINT);
+    let plus_order_final_x = Int::new(*centered.as_int());
+
+    group.bench_function("direct representative", |bench| {
+        bench.iter(|| {
+            black_box(verify_ecdsa_result_binding(
+                black_box(&signature_r),
+                black_box(&direct_final_x),
+            ))
+            .expect("the benchmark fixture is a valid ECDSA result binding")
+        });
+    });
+
+    group.bench_function("r+n representative", |bench| {
+        bench.iter(|| {
+            black_box(verify_ecdsa_result_binding(
+                black_box(&signature_r),
+                black_box(&plus_order_final_x),
+            ))
+            .expect("the benchmark fixture is a valid ECDSA result binding")
+        });
+    });
+
+    group.finish();
+}
+
+fn benchmark_scalar_bytes(value: &CbUint<EC_FP_INT_LIMBS>) -> [u8; 32] {
+    let mut bytes = [0_u8; 32];
+    for (index, word) in value.as_words().iter().rev().enumerate() {
+        bytes[index * 8..(index + 1) * 8].copy_from_slice(&word.to_be_bytes());
+    }
+    bytes
+}
+
+fn benchmark_add_mod_order(
+    left: &CbUint<EC_FP_INT_LIMBS>,
+    right: &CbUint<EC_FP_INT_LIMBS>,
+) -> CbUint<EC_FP_INT_LIMBS> {
+    let left: CbUint<{ EC_FP_INT_LIMBS * 2 }> = left.resize();
+    let right: CbUint<{ EC_FP_INT_LIMBS * 2 }> = right.resize();
+    let sum = left.wrapping_add(&right);
+    let order: CbUint<{ EC_FP_INT_LIMBS * 2 }> = SECP256K1_N_UINT.resize();
+    let order = NonZero::new(order).expect("secp256k1 order is nonzero");
+    let (_, remainder) = sum.div_rem_vartime(&order);
+    remainder.resize()
+}
+
+fn sha_ecdsa_scalar_binding_benches(c: &mut Criterion) {
+    const NUM_VARS: usize = 9;
+    type U = ShaEcdsaUair<RealEcdsaInt>;
+
+    // d = k = 1 makes Q = G and R = G. This gives an independently
+    // checkable complete application fixture while leaving the measured
+    // path entirely verifier-side.
+    let mut rng = StdRng::seed_from_u64(0x4837_7001);
+    let sha_trace = <Sha256CompressionSliceUair<RealEcdsaInt> as GenerateRandomTrace<32>>::generate_random_trace(
+        NUM_VARS,
+        &mut rng,
+    );
+    let sha_public =
+        sha_trace.public(&<Sha256CompressionSliceUair<RealEcdsaInt> as Uair>::signature());
+    let digest = extract_sha256_output(&sha_public).expect("benchmark SHA output must exist");
+    let message_representative = CbUint::<EC_FP_INT_LIMBS>::from_be_slice(&digest);
+    let reduced_message = if message_representative >= SECP256K1_N_UINT {
+        message_representative.wrapping_sub(&SECP256K1_N_UINT)
+    } else {
+        message_representative
+    };
+    let signature_r = benchmark_scalar_bytes(&SECP256K1_G_X_UINT);
+    let signature_s = benchmark_scalar_bytes(&benchmark_add_mod_order(
+        &reduced_message,
+        &SECP256K1_G_X_UINT,
+    ));
+    let trace = build_trace_from_sha_and_signature(
+        NUM_VARS,
+        sha_trace,
+        (SECP256K1_G_X_UINT, SECP256K1_G_Y_UINT),
+        &signature_r,
+        &signature_s,
+    )
+    .expect("d = k = 1 benchmark fixture must build");
+    let public_trace = trace.public(&<U as Uair>::signature());
+
+    verify_sha_ecdsa_application_binding(&signature_r, &signature_s, &public_trace)
+        .expect("benchmark fixture must satisfy H7 and H6");
+
+    let mut group = c.benchmark_group("SHA-ECDSA Scalar Binding");
+    group.bench_function("derive digest/u1/u2", |bench| {
+        bench.iter(|| {
+            let digest = extract_sha256_output(black_box(&public_trace))
+                .expect("benchmark SHA output must exist");
+            black_box(derive_ecdsa_verification_scalars(
+                black_box(digest),
+                black_box(&signature_r),
+                black_box(&signature_s),
+            ))
+            .expect("benchmark scalar derivation must pass")
+        });
+    });
+    group.bench_function("bind 512 scalar bits", |bench| {
+        bench.iter(|| {
+            black_box(verify_sha_ecdsa_scalar_binding(
+                black_box(&signature_r),
+                black_box(&signature_s),
+                black_box(&public_trace),
+            ))
+            .expect("benchmark scalar binding must pass")
+        });
+    });
+    group.bench_function("compose H7 scalars + H6 result", |bench| {
+        bench.iter(|| {
+            black_box(verify_sha_ecdsa_application_binding(
+                black_box(&signature_r),
+                black_box(&signature_s),
+                black_box(&public_trace),
+            ))
+            .expect("benchmark application binding must pass")
+        });
+    });
+    group.finish();
+}
+
+fn sha_ecdsa_h8_binding_benches(c: &mut Criterion) {
+    const NUM_VARS: usize = 9;
+    type U = ShaEcdsaUair<RealEcdsaInt>;
+
+    let prefix = b"zinc-plus-lab:h8:honest-sha-ecdsa:v1\n";
+    let mut message = prefix.to_vec();
+    message.extend(
+        (0_u16..)
+            .map(|counter| counter as u8)
+            .take(sha256::SEVEN_BLOCK_MESSAGE_BYTES - prefix.len()),
+    );
+    let signature_r = benchmark_scalar_bytes(&CbUint::from_be_hex(
+        "5CD26EE278677AEBEC2C8E7486023D9299EF1B5705D3BE62531E98247E5E8302",
+    ));
+    let signature_s = benchmark_scalar_bytes(&CbUint::from_be_hex(
+        "7835018BB2CFF73325391068D670363C81AF019C87BC2CAC96672133C2B59568",
+    ));
+    let q = (
+        CbUint::from_be_hex(
+            "C6047F9441ED7D6D3045406E95C07CD85C778E4B8CEF3CA7ABAC09B95C709EE5",
+        ),
+        CbUint::from_be_hex(
+            "1AE168FEA63DC339A3C58419466CEAEEF7F632653266D0E1236431A950CFE52A",
+        ),
+    );
+    let q_x = benchmark_scalar_bytes(&q.0);
+    let q_y = benchmark_scalar_bytes(&q.1);
+    let trace = build_trace_from_message_and_signature::<RealEcdsaInt>(
+        NUM_VARS,
+        &message,
+        q,
+        &signature_r,
+        &signature_s,
+    )
+    .expect("frozen H8 benchmark fixture must build");
+    let public_trace = trace.public(&<U as Uair>::signature());
+    verify_sha_ecdsa_h8_application_binding(
+        &message,
+        &signature_r,
+        &signature_s,
+        &q_x,
+        &q_y,
+        &public_trace,
+    )
+    .expect("frozen H8 benchmark fixture must bind");
+
+    let mut group = c.benchmark_group("SHA-ECDSA H8 Binding");
+    group.bench_function("honest seven-block SHA statement", |bench| {
+        bench.iter(|| {
+            black_box(verify_sha_ecdsa_honest_sha_binding(
+                black_box(&message),
+                black_box(&public_trace),
+            ))
+            .expect("H8 SHA binding must pass")
+        });
+    });
+    group.bench_function("public Q and G+Q", |bench| {
+        bench.iter(|| {
+            black_box(verify_ecdsa_public_key_binding_in_columns(
+                black_box(&q_x),
+                black_box(&q_y),
+                black_box(&public_trace.int),
+                [
+                    sha_ecdsa_cols::ECDSA_PA_QX,
+                    sha_ecdsa_cols::ECDSA_PA_QY,
+                    sha_ecdsa_cols::ECDSA_PA_QGX,
+                    sha_ecdsa_cols::ECDSA_PA_QGY,
+                ],
+            ))
+            .expect("H8 public-key binding must pass")
+        });
+    });
+    group.bench_function("complete message/signature/key/result", |bench| {
+        bench.iter(|| {
+            black_box(verify_sha_ecdsa_h8_application_binding(
+                black_box(&message),
+                black_box(&signature_r),
+                black_box(&signature_s),
+                black_box(&q_x),
+                black_box(&q_y),
+                black_box(&public_trace),
+            ))
+            .expect("complete H8 binding must pass")
+        });
+    });
+    group.finish();
+}
+
+/// Prints peak resident-set-size of the bench process via
+/// `getrusage(RUSAGE_SELF)`. `ru_maxrss` is monotonic across the process
+/// lifetime, so the value reflects the peak observed across every bench that
+/// has run so far in this process.
 fn print_peak_rss(label: &str) {
     let mut usage = std::mem::MaybeUninit::<libc::rusage>::uninit();
     // SAFETY: getrusage writes a fully-initialized rusage on success.
@@ -2227,7 +2413,6 @@ fn print_peak_rss(label: &str) {
     eprintln!("[{label}] peak RSS: {bytes} B ({mib:.2} MiB / {gib:.3} GiB)");
 }
 
-
 criterion_group! {
     name = e2e;
     config = Criterion::default().sample_size(500);
@@ -2248,4 +2433,27 @@ criterion_group! {
     config = Criterion::default().sample_size(500);
     targets = e2e_folded_4x_benches
 }
-criterion_main!(e2e, e2e_steps, e2e_folded, e2e_folded_4x);
+criterion_group! {
+    name = ecdsa_result_binding;
+    config = Criterion::default().sample_size(500);
+    targets = ecdsa_result_binding_benches
+}
+criterion_group! {
+    name = sha_ecdsa_scalar_binding;
+    config = Criterion::default().sample_size(500);
+    targets = sha_ecdsa_scalar_binding_benches
+}
+criterion_group! {
+    name = sha_ecdsa_h8_binding;
+    config = Criterion::default().sample_size(500);
+    targets = sha_ecdsa_h8_binding_benches
+}
+criterion_main!(
+    e2e,
+    e2e_steps,
+    e2e_folded,
+    e2e_folded_4x,
+    ecdsa_result_binding,
+    sha_ecdsa_scalar_binding,
+    sha_ecdsa_h8_binding,
+);

@@ -978,7 +978,7 @@ pub trait Uair: Clone {
     ) -> Result<(), PublicStructureError>
     where
         R: Clone,
-        IntT: Clone + num_traits::Zero,
+        IntT: Clone + num_traits::Zero + num_traits::One + PartialEq,
     {
         Ok(())
     }
@@ -989,6 +989,19 @@ pub trait Uair: Clone {
 /// violated.
 #[derive(Debug, Clone, thiserror::Error)]
 pub enum PublicStructureError {
+    /// The verifier received a public trace with the wrong number of
+    /// columns in one column family. Structural checks must reject this
+    /// before indexing into the trace rather than relying on debug-only
+    /// assertions.
+    #[error("public trace has {actual} {column_family} columns, but the UAIR requires {expected}")]
+    WrongColumnCount {
+        /// Human-readable column family (binary_poly, arbitrary_poly, or int).
+        column_family: &'static str,
+        /// Number of public columns declared by the UAIR.
+        expected: usize,
+        /// Number of columns supplied by the verifier input.
+        actual: usize,
+    },
     /// A public column expected to be zero on a particular row was
     /// non-zero. Carries enough context to localise the failure.
     #[error("public column '{column}' must be zero at row {row}, but is non-zero")]

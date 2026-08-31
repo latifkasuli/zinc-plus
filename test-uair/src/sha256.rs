@@ -5,12 +5,10 @@
 //! Implements the full SHA-256 compression round-function and message
 //! schedule as a UAIR, with the `F_2[X]` rotation constraints lifted to
 //! `Q[X]` via per-coefficient overflow witnesses (see below). The UAIR
-//! ties both ends of the compression via public inputs:
-//!
-//! - init: `a_hat[0] = y_a_public` (one boundary row for `a` only)
-//! - final: `a_hat[row] = y_a_public[row]` and `e_hat[row] = y_e_public[row]`
-//!   at each of the last four rows, encoding `(d, c, b, a)` / `(h, g, f, e)`
-//!   under the SHA-256 shift-register convention.
+//! ties every compression boundary to public inputs. Four-row `a` and `e`
+//! prefixes encode `(d,c,b,a)` and `(h,g,f,e)` in shift-register order;
+//! feed-forward constraints connect each compression to the next prefix,
+//! and a final four-row public prefix carries the eight output words.
 //!
 //! Covered constraint families, for every active row `t`:
 //!
@@ -31,31 +29,21 @@
 //!    expressed at anchor row `k = t − 16` with forward shifts. Because
 //!    `DensePolynomial<R, 32>` can't hold `X^32`, we use `2·X^31` — same
 //!    value `2^32` when evaluated at `X = 2`.
-//! 8. Register-update `a`:
-//!    `s_upd · (a[t+1] − (h[t] + Sigma_1(e[t]) + Ch[t] + K[t] + W[t]
-//!                        + Sigma_0(a[t]) + Maj[t]) + 2·X^31 · mu_a[t]) ∈ (X − 2)`
-//!    where `h[t] = e[t-3]` under the SHA-256 shift-register trick. Anchored
-//!    at row `k = t − 3`; shifts 0..4 on `w_a`, `w_e`, plus shift 3 on all
-//!    per-row quantities.
-//! 9. Register-update `e`:
-//!    `s_upd · (e[t+1] − (d[t] + h[t] + Sigma_1(e[t]) + Ch[t] + K[t] + W[t])
-//!              + 2·X^31 · mu_e[t]) ∈ (X − 2)`
-//!    where `d[t] = a[t-3]`.
-//! 10. Init boundary:  `s_init  · (a_hat − y_a_public) == 0`  (row 0).
-//! 11. Final boundary (a-family): `s_final · (a_hat − y_a_public) == 0`
-//!     applied at rows `n−4 .. n−1`. `y_a_public` is a dual-purpose column:
-//!     it carries the initial `a` at row 0 and the final `(d, c, b, a)` values
-//!     at rows `n−4, n−3, n−2, n−1`, with zeros everywhere in between. Under
-//!     the SHA-256 shift-register convention, `a[t]` at the last round *is*
-//!     the final `a`; `a[t−1]` is the final `b`; etc., so placing the
-//!     values in the `a` column at consecutive rows at the end of the trace
-//!     correctly encodes `(y_a, y_b, y_c, y_d)`.
+//! 8. Register-update `a`, for round `j` at anchor row `k = j`:
+//!    `a' − (h + Sigma_1(e) + Ch + K[j] + W[j] + Sigma_0(a) + Maj)
+//!        + 2·X^31 · mu_a ∈ (X − 2)`.
+//!    State words and boolean operands use the shift-register offsets at
+//!    `k..k+4`; `K[j]` and `W[j]` are row-local at `k`.
+//! 9. Register-update `e`, with the same row-local `K[j]` and `W[j]`.
+//! 10–11. Four-row init/output-prefix pins for both `a` and `e` families.
+//! 12–13. Componentwise feed-forward additions into the next prefix.
+//! 16. Sixteen public message-schedule seed words per compression.
+//! 18–22. Active-range zero pins for the linear-constraint compensators.
 //!
-//! Ch and Maj are left as **free witness columns** (bit-polys, unenforced
-//! against the true boolean function). A spec-faithful implementation would
-//! add lookup or degree-2 constraints; lookups are stubbed upstream so this
-//! slice adopts the same "lookup-gap" stance we already have for other
-//! bit-valued cells.
+//! `Ch` and `Maj` are enforced through the virtual binary-polynomial
+//! residuals described below. Booleanity of those residuals, together with
+//! the binary source columns, forces the required per-bit truth tables
+//! without relying on the currently unavailable arbitrary lookup path.
 //!
 //! The `rho_*` scalars encode the rotation parts of the SHA-256 Σ
 //! functions (Σ_0 and Σ_1 still use the F_2[X] → Q[X] rotation lift;
@@ -155,15 +143,14 @@
 //! and `−e[k] / a[k]+a[k+1]` slip negative or to 2; the public
 //! compensators `PA_R_CH2_COMP` / `PA_R_MAJ_COMP` carry the bit pattern
 //! that absorbs the off-trace zero-padding (zero on every other row).
-//! - **K column** is populated with random integers rather than the
-//!   SHA-256-specified round constants. Both prover and verifier see the
-//!   same values (it's a public column), so the round-trip succeeds; a
-//!   full SHA-256 implementation would pin these.
-//! - **Initial-state public inputs for `e`, `d = a[t-3]`, `h = e[t-3]`** —
-//!   these would let a verifier pin the initial compression state. The
-//!   init boundary currently only constrains `a[0] = pa_a[0]`.
+//! - **K column** carries the canonical SHA-256 round constants on every
+//!   active compression window. Application-level verification pins the
+//!   public column to [`K_CANONICAL`].
+//! - **Initial-state public inputs** — each compression's four-row `a` and
+//!   `e` prefixes are constrained to `PA_A` and `PA_E`. Whether the first
+//!   prefix is the FIPS 180-4 IV is an application-statement obligation.
 
-use core::marker::PhantomData;
+use core::{fmt, marker::PhantomData};
 
 use crypto_primitives::{ConstSemiring, PrimeField, Semiring};
 use rand::RngCore;
@@ -298,9 +285,9 @@ pub mod cols {
     pub const W_W: usize = 13;
     pub const W_LSIG0: usize = 14;
     pub const W_LSIG1: usize = 15;
-    // Register update — Ch is replaced by two AND-operand bit-polys
-    // (`u_ef = e ∧ f` and `u_{¬e,g} = ¬e ∧ g`). Maj is still a free
-    // witness on this column. See the module doc for the Table 9 split.
+    // Register update — Ch is represented by two AND-operand bit-polys
+    // (`u_ef = e ∧ f` and `u_{¬e,g} = ¬e ∧ g`). Maj and both Ch operands
+    // are pinned by the virtual binary residuals in the module doc.
     pub const W_U_EF: usize = 16;
     pub const W_U_NEG_E_G: usize = 17;
     pub const W_MAJ: usize = 18;
@@ -464,7 +451,9 @@ where
             ShiftSpec::new(cols::FLAT_W_E, 4),
             // w_sig1: Sigma_1(e[t]) at anchor t-3.
             ShiftSpec::new(cols::FLAT_W_SIG1, 3),
-            // w_W: message-schedule 9, 16 AND register-update 3.
+            // w_W: message-schedule 9, 16. The retained shift-3 slot is
+            // compatibility padding for the frozen proof geometry; register
+            // updates consume the row-local W[t].
             ShiftSpec::new(cols::FLAT_W_W, 3),
             ShiftSpec::new(cols::FLAT_W_W, 9),
             ShiftSpec::new(cols::FLAT_W_W, 16),
@@ -697,6 +686,7 @@ where
         let s_msg_init = &sel[cols::S_MSG_INIT];
         let s_active_sched = &sel[cols::S_ACTIVE_SCHED];
         let s_active_upd = &sel[cols::S_ACTIVE_UPD];
+        let pa_k = &sel[cols::PA_K];
         let pa_c_c7 = &sel[cols::PA_C_C7];
         let pa_c_c8 = &sel[cols::PA_C_C8];
         let pa_c_c9 = &sel[cols::PA_C_C9];
@@ -722,7 +712,9 @@ where
         let _down_w_e_sh2 = &down.binary_poly[5];
         let down_w_e_sh4 = &down.binary_poly[6];
         let down_w_sig1_sh3 = &down.binary_poly[7];
-        let down_w_w_sh3 = &down.binary_poly[8];
+        // Retained to preserve the pre-H8 shift geometry. Standard round
+        // binding now consumes the row-local W cell directly.
+        let _down_w_w_sh3 = &down.binary_poly[8];
         let down_w_w_sh9 = &down.binary_poly[9];
         let down_w_w_sh16 = &down.binary_poly[10];
         let down_w_lsig0_sh1 = &down.binary_poly[11];
@@ -733,9 +725,10 @@ where
         let down_w_u_neg_e_g_sh3 = &down.binary_poly[16];
         let _down_w_maj_sh2 = &down.binary_poly[17];
         let down_w_maj_sh3 = &down.binary_poly[18];
-        // int slots: only PA_K survives (the 3 mu_* int shift specs
-        // are gone alongside the dropped int carry columns).
-        let down_pa_k_sh3 = &down.int[0];
+        // The PA_K shift is retained only for pre-H8 proof geometry;
+        // standard round binding consumes row-local PA_K directly. The
+        // 3 prior mu_* shifts are gone with the dropped carry columns.
+        let _down_pa_k_sh3 = &down.int[0];
 
         // Bit-op virtual columns sorted by (source_col, op_kind, c)
         // inside `UairSignature::new`. With FLAT_W_W < FLAT_W_MU_PACKED,
@@ -865,21 +858,20 @@ where
             + &mu_w_contrib;
         b.assert_in_ideal(sched_inner + pa_c_c7, &ideal_rot_x2);
 
-        // Constraint 8: Register-update for `a`, anchored at k = t − 3.
-        //   (a[t+1] − (h[t] + Sigma_1(e[t]) + Ch[t] + K[t] + W[t]
-        //              + Sigma_0(a[t]) + Maj[t])
-        //    + 2·X^31 · mu_a[t] + pa_c_c8) ∈ (X − 2)
+        // Constraint 8: register update for round j at anchor k = j.
+        // State words use the shift-register offsets k..k+4, while the
+        // round's K[j] and W[j] values are row-local at k.
         //
         // With the shift-register aliasing h[t] = e[t-3] = up.w_e, and
         // Ch[t] = u_ef[t] + u_{¬e,g}[t] (the two AND-operand bit-polys
         // never share a set bit, so addition equals XOR coefficient-wise).
         // References at anchor k:
-        //   a[t+1]       = down.w_a^↓4     e[t-3]       = up.w_e
-        //   a[t]         = down.w_a^↓3     Sigma_1(e[t]) = down.w_sig1^↓3
-        //   Sigma_0(a[t]) = down.w_sig0^↓3 u_ef[t]       = down.w_u_ef^↓3
-        //   u_{¬e,g}[t]  = down.w_u_neg_e_g^↓3
-        //   Maj[t]       = down.w_maj^↓3   W[t]         = down.w_W^↓3
-        //   K[t]         = down.pa_K^↓3   mu_a[t]       = down.w_mu_a^↓3
+        //   a'           = down.w_a^↓4     h             = up.w_e
+        //   a            = down.w_a^↓3     Sigma_1(e)    = down.w_sig1^↓3
+        //   Sigma_0(a)   = down.w_sig0^↓3 u_ef          = down.w_u_ef^↓3
+        //   u_{¬e,g}     = down.w_u_neg_e_g^↓3
+        //   Maj          = down.w_maj^↓3   W[j]          = up.w_W
+        //   K[j]         = up.pa_K         mu_a          = up.w_mu_a
         // pa_c_c8 is the witness compensator (see C7 note); zero-on-active
         // pinned in-circuit by C19: `pa_c_c8 · S_ACTIVE_UPD = 0`.
         let a_update_inner = down_w_a_sh4.clone()
@@ -887,27 +879,24 @@ where
             - down_w_sig1_sh3             // Sigma_1(e[t])
             - down_w_u_ef_sh3             // Ch[t] = u_ef + u_{¬e,g}
             - down_w_u_neg_e_g_sh3
-            - down_pa_k_sh3               // K[t]
-            - down_w_w_sh3                // W[t]
+            - pa_k                         // K[t]
+            - w_big_w                      // W[t]
             - down_w_sig0_sh3             // Sigma_0(a[t])
             - down_w_maj_sh3              // Maj[t]
             + &mu_a_contrib;              // = 2^32 · mu_a (bits 2-4 of W_MU_PACKED)
         b.assert_in_ideal(a_update_inner + pa_c_c8, &ideal_rot_x2);
 
-        // Constraint 9: Register-update for `e`, anchored at k = t − 3.
-        //   (e[t+1] − (d[t] + h[t] + Sigma_1(e[t]) + Ch[t] + K[t] + W[t])
-        //    + 2·X^31 · mu_e[t] + pa_c_c9) ∈ (X − 2)
-        //
-        // With d[t] = a[t-3] = up.w_a and h[t] = e[t-3] = up.w_e, and
-        // Ch[t] = u_ef[t] + u_{¬e,g}[t] as in C8.
+        // Constraint 9: register update for e at the same round anchor.
+        // Here d and h are the row-local up values, while the e/Ch
+        // operands use shift-register offset 3 as in C8.
         let e_update_inner = down_w_e_sh4.clone()
             - w_a                         // d[t] = a[t-3]
             - w_e                         // h[t] = e[t-3]
             - down_w_sig1_sh3
             - down_w_u_ef_sh3             // Ch[t] = u_ef + u_{¬e,g}
             - down_w_u_neg_e_g_sh3
-            - down_pa_k_sh3
-            - down_w_w_sh3
+            - pa_k
+            - w_big_w
             + &mu_e_contrib;              // = 2^32 · mu_e (bits 5-7 of W_MU_PACKED)
         b.assert_in_ideal(e_update_inner + pa_c_c9, &ideal_rot_x2);
 
@@ -1026,8 +1015,23 @@ where
         IntT: Clone,
     {
         let n = 1usize << num_vars;
-        debug_assert_eq!(public_trace.int.len(), cols::NUM_INT_PUB);
-        debug_assert!(public_trace.binary_poly.len() >= cols::NUM_BIN_PUB);
+        for (column_family, expected, actual) in [
+            (
+                "binary_poly",
+                cols::NUM_BIN_PUB,
+                public_trace.binary_poly.len(),
+            ),
+            ("arbitrary_poly", 0, public_trace.arbitrary_poly.len()),
+            ("int", cols::NUM_INT_PUB, public_trace.int.len()),
+        ] {
+            if actual != expected {
+                return Err(PublicStructureError::WrongColumnCount {
+                    column_family,
+                    expected,
+                    actual,
+                });
+            }
+        }
 
         let pa_r_ch2_comp = &public_trace.binary_poly[cols::PA_R_CH2_COMP].evaluations;
         let pa_r_maj_comp = &public_trace.binary_poly[cols::PA_R_MAJ_COMP].evaluations;
@@ -1100,9 +1104,8 @@ fn pow_two<R: ConstSemiring>(k: u32) -> R {
 /// the first 32 bits of the fractional parts of the cube roots of the
 /// first 64 primes. Cycled per compression by the trace generator: at
 /// each compression starting at row `start = 68·i`, the trace gen
-/// writes `K_CANONICAL[j]` to `pa_K[start + 3 + j]` for `j ∈ [0, 64)`,
-/// so the C8/C9 read at anchor `k = start + j` (which references
-/// `down.pa_K^↓3 = pa_K[k+3]`) lands on the right round constant.
+/// writes `K_CANONICAL[j]` to `pa_K[start + j]` for `j ∈ [0, 64)`,
+/// so C8/C9 consume the canonical row-local round constant.
 pub const K_CANONICAL: [u32; 64] = [
     0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1,
     0x923f82a4, 0xab1c5ed5, 0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3,
@@ -1116,6 +1119,128 @@ pub const K_CANONICAL: [u32; 64] = [
     0x5b9cca4f, 0x682e6ff3, 0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208,
     0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
 ];
+
+/// FIPS 180-4 section 5.3.3 initial hash values in display order H0..H7.
+pub const IV_CANONICAL: [u32; 8] = [
+    0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c,
+    0x1f83d9ab, 0x5be0cd19,
+];
+
+/// Number of bytes consumed by the fixed seven-compression SHA statement.
+pub const SEVEN_BLOCK_MESSAGE_BYTES: usize = 400;
+
+/// Number of bytes in the canonical seven-block padded stream.
+pub const SEVEN_BLOCK_PADDED_BYTES: usize = cols::NUM_COMPRESSIONS * 64;
+
+/// Failure while constructing the fixed-size honest SHA statement trace.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Sha256MessageTraceError {
+    /// H8 uses one exact 400-byte statement message.
+    MessageLength { actual_bytes: usize },
+}
+
+impl fmt::Display for Sha256MessageTraceError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::MessageLength { actual_bytes } => write!(
+                formatter,
+                "SHA statement message must be exactly {SEVEN_BLOCK_MESSAGE_BYTES} bytes, got {actual_bytes}",
+            ),
+        }
+    }
+}
+
+impl std::error::Error for Sha256MessageTraceError {}
+
+/// Apply canonical SHA-256 padding to the fixed 400-byte H8 message.
+pub fn pad_seven_block_message(
+    message: &[u8],
+) -> Result<[u8; SEVEN_BLOCK_PADDED_BYTES], Sha256MessageTraceError> {
+    if message.len() != SEVEN_BLOCK_MESSAGE_BYTES {
+        return Err(Sha256MessageTraceError::MessageLength {
+            actual_bytes: message.len(),
+        });
+    }
+
+    let mut padded = [0_u8; SEVEN_BLOCK_PADDED_BYTES];
+    padded[..message.len()].copy_from_slice(message);
+    padded[message.len()] = 0x80;
+    let bit_length = (message.len() as u64) * 8;
+    padded[SEVEN_BLOCK_PADDED_BYTES - 8..].copy_from_slice(&bit_length.to_be_bytes());
+    Ok(padded)
+}
+
+struct ScriptedWords {
+    words: Vec<u32>,
+    next: usize,
+}
+
+impl ScriptedWords {
+    fn next_word(&mut self) -> u32 {
+        let word = *self
+            .words
+            .get(self.next)
+            .expect("SHA trace generator consumed more scripted words than expected");
+        self.next += 1;
+        word
+    }
+}
+
+impl RngCore for ScriptedWords {
+    fn next_u32(&mut self) -> u32 {
+        self.next_word()
+    }
+
+    fn next_u64(&mut self) -> u64 {
+        (u64::from(self.next_word()) << 32) | u64::from(self.next_word())
+    }
+
+    fn fill_bytes(&mut self, destination: &mut [u8]) {
+        for chunk in destination.chunks_mut(4) {
+            let bytes = self.next_word().to_le_bytes();
+            chunk.copy_from_slice(&bytes[..chunk.len()]);
+        }
+    }
+}
+
+/// Build the seven-compression trace for the canonical IV and one exact
+/// 400-byte statement message.
+pub fn build_trace_from_message<R>(
+    num_vars: usize,
+    message: &[u8],
+) -> Result<UairTrace<'static, R, R, 32>, Sha256MessageTraceError>
+where
+    R: ConstSemiring + From<u32> + 'static,
+{
+    let padded = pad_seven_block_message(message)?;
+    let mut words = Vec::with_capacity(8 + cols::NUM_COMPRESSIONS * 16);
+    words.extend_from_slice(&[
+        IV_CANONICAL[3],
+        IV_CANONICAL[2],
+        IV_CANONICAL[1],
+        IV_CANONICAL[0],
+        IV_CANONICAL[7],
+        IV_CANONICAL[6],
+        IV_CANONICAL[5],
+        IV_CANONICAL[4],
+    ]);
+    words.extend(
+        padded
+            .chunks_exact(4)
+            .map(|chunk| u32::from_be_bytes(chunk.try_into().expect("four-byte chunk"))),
+    );
+    let expected_words = words.len();
+    let mut scripted = ScriptedWords { words, next: 0 };
+    let trace = <Sha256CompressionSliceUair<R> as GenerateRandomTrace<32>>::generate_random_trace(
+        num_vars,
+        &mut scripted,
+    );
+    assert_eq!(
+        scripted.next, expected_words,
+        "SHA trace generator did not consume the complete scripted statement",
+    );
+    Ok(trace)
+}
 
 #[inline]
 fn rotr(x: u32, n: u32) -> u32 {
@@ -1372,15 +1497,10 @@ where
 
             // 3) Per-compression round constants. Cycle the canonical
             //    SHA-256 K table per compression at rows
-            //    `[start + 3, start + 67)` so that C8/C9 at active
-            //    anchors `k ∈ [start, start + 64)` (which read
-            //    `down.pa_K^↓3 = pa_K[k+3]`) see `K_CANONICAL[k - start]`.
-            //    Rows `start..start+3` and `start+67` are not read by
-            //    any active anchor of compression i, so they're left
-            //    as zero. (The compensator pa_c_c8/c9 absorbs whatever
-            //    those rows contain.)
+            //    `[start, start + 64)` so C8/C9 at active anchors
+            //    `k ∈ [start, start + 64)` see `K_CANONICAL[k - start]`.
             for j in 0..cols::ROUNDS_PER_COMP {
-                k_vals[start + 3 + j] = K_CANONICAL[j];
+                k_vals[start + j] = K_CANONICAL[j];
             }
 
             // 4) Round-update: 64 rounds, anchor k = start+0..=start+63
@@ -1396,7 +1516,6 @@ where
             //            e_sum = d + T1   (6 terms ⇒ mu_e ∈ {0..=5}).
             for j in 0..rounds {
                 let k = start + j;
-                let t = k + 3; // spec round number under the t = k+3 anchor convention
 
                 let a_t = a_vals[k + 3]; // a[t]
                 let a_t1 = a_vals[k + 2]; // a[t-1] = b
@@ -1413,8 +1532,8 @@ where
                 let t1: u64 = (e_vals[k] as u64) // h = e[t-3]
                     + (sig1_e_t as u64)
                     + (ch_t as u64)
-                    + (k_vals[t] as u64)
-                    + (w_vals[t] as u64);
+                    + (k_vals[k] as u64)
+                    + (w_vals[k] as u64);
                 let t2: u64 = (sig0_a_t as u64) + (maj_t as u64);
                 let a_sum: u64 = t1 + t2;
                 let e_sum: u64 = (a_vals[k] as u64) + t1; // d + T1, d = a[t-3]
@@ -1710,8 +1829,8 @@ where
             })
             .collect();
 
-        // C8: inner(2) = w_a[k+4] − w_e[k] − sig1[k+3] − Ch[k+3] − K[k+3]
-        //               − W[k+3] − sig0[k+3] − maj[k+3] + 2^32 · mu_a[k+3]
+        // C8: inner(2) = w_a[k+4] − w_e[k] − sig1[k+3] − Ch[k+3] − K[k]
+        //               − W[k] − sig0[k+3] − maj[k+3] + 2^32 · mu_a[k]
         // with Ch[k+3] = u_ef[k+3] + u_{¬e,g}[k+3].
         let pa_c_c8_col: Vec<R> = (0..n)
             .map(|k| {
@@ -1720,20 +1839,19 @@ where
                 let sig1_k3 = load(&sig1_vals, k + 3);
                 let u_ef_k3 = load(&u_ef_vals, k + 3);
                 let u_neg_e_g_k3 = load(&u_neg_e_g_vals, k + 3);
-                let k_k3 = load(&k_vals, k + 3);
-                let w_k3 = load(&w_vals, k + 3);
+                let k_k = load(&k_vals, k);
+                let w_k = load(&w_vals, k);
                 let sig0_k3 = load(&sig0_vals, k + 3);
                 let maj_k3 = load(&maj_vals, k + 3);
-                // mu_a stored at C8-anchor row k (= round t = k+3 was
-                // formerly stored at k+3; now at row k).
+                // mu_a is stored at the C8 round-anchor row k.
                 let mu_a_k = load(&mu_a_vals, k);
                 let two32_mu = two_to_32.clone() * &mu_a_k;
                 w_e_k
                     + &sig1_k3
                     + &u_ef_k3
                     + &u_neg_e_g_k3
-                    + &k_k3
-                    + &w_k3
+                    + &k_k
+                    + &w_k
                     + &sig0_k3
                     + &maj_k3
                     - &two32_mu
@@ -1742,7 +1860,7 @@ where
             .collect();
 
         // C9: inner(2) = w_e[k+4] − w_a[k] − w_e[k] − sig1[k+3] − Ch[k+3]
-        //               − K[k+3] − W[k+3] + 2^32 · mu_e[k+3]
+        //               − K[k] − W[k] + 2^32 · mu_e[k]
         // with Ch[k+3] = u_ef[k+3] + u_{¬e,g}[k+3].
         let pa_c_c9_col: Vec<R> = (0..n)
             .map(|k| {
@@ -1752,8 +1870,8 @@ where
                 let sig1_k3 = load(&sig1_vals, k + 3);
                 let u_ef_k3 = load(&u_ef_vals, k + 3);
                 let u_neg_e_g_k3 = load(&u_neg_e_g_vals, k + 3);
-                let k_k3 = load(&k_vals, k + 3);
-                let w_k3 = load(&w_vals, k + 3);
+                let k_k = load(&k_vals, k);
+                let w_k = load(&w_vals, k);
                 // mu_e stored at C9-anchor row k (analogous to mu_a).
                 let mu_e_k = load(&mu_e_vals, k);
                 let two32_mu = two_to_32.clone() * &mu_e_k;
@@ -1762,8 +1880,8 @@ where
                     + &sig1_k3
                     + &u_ef_k3
                     + &u_neg_e_g_k3
-                    + &k_k3
-                    + &w_k3
+                    + &k_k
+                    + &w_k
                     - &two32_mu
                     - &w_e_k4
             })
@@ -1835,6 +1953,7 @@ where
 mod tests {
     use super::*;
     use crypto_primitives::crypto_bigint_int::Int;
+    use zinc_poly::EvaluatablePolynomial;
     use zinc_uair::degree_counter::{count_effective_max_degree, count_max_degree};
 
     /// All non-zero-ideal SHA constraints (C1, C2, C4, C6, C7, C8, C9,
@@ -1913,5 +2032,100 @@ mod tests {
             0x27ae41e4, 0x649b934c, 0xa495991b, 0x7852b855,
         ];
         assert_eq!(h_out, expected, "SHA-256(\"\") digest mismatch — K table or round logic drift");
+    }
+
+    #[test]
+    fn honest_seven_block_builder_matches_frozen_oracle() {
+        let prefix = b"zinc-plus-lab:h8:honest-sha-ecdsa:v1\n";
+        let mut message = prefix.to_vec();
+        message.extend(
+            (0_u16..)
+                .map(|counter| counter as u8)
+                .take(SEVEN_BLOCK_MESSAGE_BYTES - prefix.len()),
+        );
+        let padded = pad_seven_block_message(&message).expect("400-byte message must pad");
+        assert_eq!(padded[400], 0x80);
+        assert!(padded[401..440].iter().all(|&byte| byte == 0));
+        assert_eq!(&padded[440..], &3200_u64.to_be_bytes());
+
+        let trace = build_trace_from_message::<Int<4>>(cols::MIN_NUM_VARS, &message)
+            .expect("honest SHA trace must build");
+        let word = |column: usize, row: usize| {
+            trace.binary_poly[column][row]
+                .evaluate_at_point(&2_u32)
+                .expect("32-bit binary word must evaluate at two")
+        };
+        assert_eq!(
+            (0..4).map(|row| word(cols::PA_A, row)).collect::<Vec<_>>(),
+            vec![IV_CANONICAL[3], IV_CANONICAL[2], IV_CANONICAL[1], IV_CANONICAL[0]],
+        );
+        assert_eq!(
+            (0..4).map(|row| word(cols::PA_E, row)).collect::<Vec<_>>(),
+            vec![IV_CANONICAL[7], IV_CANONICAL[6], IV_CANONICAL[5], IV_CANONICAL[4]],
+        );
+
+        let output = cols::NUM_COMPRESSIONS * cols::ROWS_PER_COMP;
+        let digest_words = [
+            word(cols::PA_A, output + 3),
+            word(cols::PA_A, output + 2),
+            word(cols::PA_A, output + 1),
+            word(cols::PA_A, output),
+            word(cols::PA_E, output + 3),
+            word(cols::PA_E, output + 2),
+            word(cols::PA_E, output + 1),
+            word(cols::PA_E, output),
+        ];
+        assert_eq!(
+            digest_words,
+            [
+                0xe2d0fa71, 0x422bd33d, 0x792095fe, 0xcf1d3ce6,
+                0xd13906e2, 0x627ee58c, 0x11e8c56c, 0xa0039188,
+            ],
+        );
+
+        assert_eq!(
+            pad_seven_block_message(&message[..399]),
+            Err(Sha256MessageTraceError::MessageLength { actual_bytes: 399 }),
+        );
+    }
+
+    #[test]
+    fn public_structure_rejects_wrong_column_counts_with_typed_errors() {
+        type U = Sha256CompressionSliceUair<Int<4>>;
+
+        let message = vec![0_u8; SEVEN_BLOCK_MESSAGE_BYTES];
+        let trace = build_trace_from_message::<Int<4>>(cols::MIN_NUM_VARS, &message)
+            .expect("400-byte message must build");
+        let public = trace.public(&U::signature());
+
+        let mut missing_binary = public.clone();
+        missing_binary
+            .binary_poly
+            .to_mut()
+            .pop()
+            .expect("SHA has public binary columns");
+        assert!(matches!(
+            U::verify_public_structure(&missing_binary, cols::MIN_NUM_VARS),
+            Err(PublicStructureError::WrongColumnCount {
+                column_family: "binary_poly",
+                expected: cols::NUM_BIN_PUB,
+                actual,
+            }) if actual == cols::NUM_BIN_PUB - 1
+        ));
+
+        let mut missing_int = public.clone();
+        missing_int
+            .int
+            .to_mut()
+            .pop()
+            .expect("SHA has public integer columns");
+        assert!(matches!(
+            U::verify_public_structure(&missing_int, cols::MIN_NUM_VARS),
+            Err(PublicStructureError::WrongColumnCount {
+                column_family: "int",
+                expected: cols::NUM_INT_PUB,
+                actual,
+            }) if actual == cols::NUM_INT_PUB - 1
+        ));
     }
 }

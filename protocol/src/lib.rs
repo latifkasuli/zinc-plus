@@ -17,6 +17,7 @@
 //! - Step 6: lift-and-project (unprojected MLE evaluations at r_0)
 //! - Step 7: Zip+ PCS open/verify at r_0
 
+pub mod application;
 pub mod fixed_prime;
 pub mod prover;
 pub mod verifier;
@@ -266,11 +267,12 @@ pub trait ZincTypes<const DEGREE_PLUS_ONE: usize>: Clone + Debug {
 /// Type bundle for the **folded** Zinc+ PIOP (1× fold, 2× column splitting).
 ///
 /// The PIOP runs at trace degree `D` (so the trace and UAIR are unchanged
-/// from the unfolded path), but the binary commitment is over `BinaryPoly<HALF_D>`
-/// — each `BinaryPoly<D>` witness column is split into two `BinaryPoly<HALF_D>`
-/// halves before commit. This decouples the trace's `BinaryPoly<D>` from the
-/// PCS's `BinaryPoly<HALF_D>`, which `ZincTypes<D>` would otherwise force to
-/// be the same (`BinaryZt::Eval = BinaryPoly<DEGREE_PLUS_ONE>`).
+/// from the unfolded path), but the binary commitment is over
+/// `BinaryPoly<HALF_D>` — each `BinaryPoly<D>` witness column is split into two
+/// `BinaryPoly<HALF_D>` halves before commit. This decouples the trace's
+/// `BinaryPoly<D>` from the PCS's `BinaryPoly<HALF_D>`, which `ZincTypes<D>`
+/// would otherwise force to be the same (`BinaryZt::Eval =
+/// BinaryPoly<DEGREE_PLUS_ONE>`).
 ///
 /// Arbitrary and integer commitments are unchanged.
 pub trait FoldedZincTypes<const D: usize, const HALF_D: usize>: Clone + Debug {
@@ -542,7 +544,10 @@ pub fn compute_lifted_evals_capped<F: PrimeField, const D: usize>(
     // can (a) skip entries that are identically zero, and (b) walk only
     // the SET bits via `trailing_zeros` + Brian Kernighan's clear-lowest
     // instead of branching on every slot.
-    debug_assert!(D <= 64, "compute_lifted_evals: bitmask packing assumes D <= 64");
+    debug_assert!(
+        D <= 64,
+        "compute_lifted_evals: bitmask packing assumes D <= 64"
+    );
     let mut result: Vec<DynamicPolynomialF<F>> = cfg_iter!(trace_bin_poly)
         .map(|col| {
             let mut coeffs = vec![zero.clone(); D];
@@ -636,8 +641,7 @@ pub fn compute_int_fold_lifted_evals<F, const H: usize, const HALF_H: usize>(
     field_cfg: &F::Config,
 ) -> Vec<DynamicPolynomialF<F>>
 where
-    F: PrimeField
-        + for<'a> FromWithConfig<&'a crypto_primitives::crypto_bigint_int::Int<HALF_H>>,
+    F: PrimeField + for<'a> FromWithConfig<&'a crypto_primitives::crypto_bigint_int::Int<HALF_H>>,
 {
     use crypto_primitives::crypto_bigint_int::Int;
     assert!(HALF_H >= 2);
@@ -683,13 +687,12 @@ where
 ///
 /// Two fast-paths shave most of the per-cell cost on traces with
 /// many small/zero int values (SHA carries):
-/// 1. **Zero-quarter skip**: if `words[i] == 0` (and `q_3` is zero),
-///    skip the `F::from_with_cfg + mul + add` for that quarter entirely.
-///    For typical SHA carry columns where `|v| < 2^64`, this elides
-///    3 of 4 monty-muls per row.
-/// 2. **u64 fast-lift**: lift `q_0..q_2` via `F::from_with_cfg(u64)`
-///    rather than building an `Int<Q>` and going through the signed
-///    `Int → F` path (which calls `is_negative`, `abs`, and `resize`).
+/// 1. **Zero-quarter skip**: if `words[i] == 0` (and `q_3` is zero), skip the
+///    `F::from_with_cfg + mul + add` for that quarter entirely. For typical SHA
+///    carry columns where `|v| < 2^64`, this elides 3 of 4 monty-muls per row.
+/// 2. **u64 fast-lift**: lift `q_0..q_2` via `F::from_with_cfg(u64)` rather
+///    than building an `Int<Q>` and going through the signed `Int → F` path
+///    (which calls `is_negative`, `abs`, and `resize`).
 #[allow(clippy::arithmetic_side_effects)]
 pub fn compute_int_fold_4x_lifted_evals<F, const H: usize, const Q: usize>(
     point: &[F],
@@ -777,11 +780,10 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crypto_bigint::U64;
-    use crypto_primitives::{
-        Field, crypto_bigint_int::Int, crypto_bigint_monty::MontyField, crypto_bigint_uint::Uint,
-    };
-    use rand::rng;
+    use core::cell::Cell;
+    use crypto_bigint::{NonZero, U64, Uint as CbUint};
+    use crypto_primitives::{Field, crypto_bigint_int::Int, crypto_bigint_uint::Uint};
+    use rand::{SeedableRng, rng, rngs::StdRng};
     use zinc_piop::{
         combined_poly_resolver::CombinedPolyResolverError, multipoint_eval::MultipointEvalError,
     };
@@ -791,9 +793,23 @@ mod tests {
         BigLinearUair, BigLinearUairWithPublicInput, BinaryDecompositionUair, BitOpRotUair,
         EC_FP_INT_LIMBS, GenerateRandomTrace, Sha256CompressionSliceUair, Sha256Ideal,
         ShaEcdsaUair, TestUairMixedDegrees, TestUairMixedShifts, TestUairNoMultiplication,
-        TestUairSimpleMultiplication,
+        TestUairSimpleMultiplication, sha256,
+        ecdsa::{
+            EcdsaResultBindingError, EcdsaResultBranch, SECP256K1_N_UINT, decode_canonical_final_x,
+            is_secp256k1_affine_point,
+        },
+        ecdsa_doubling::{SECP256K1_G_X_UINT, SECP256K1_G_Y_UINT},
+        sha_ecdsa::{
+            ShaEcdsaApplicationBindingError, ShaEcdsaScalarBindingError,
+            build_trace_from_ecdsa_scalars, build_trace_from_message_and_signature,
+            build_trace_from_sha_and_signature, cols as sha_ecdsa_cols,
+            derive_ecdsa_verification_scalars, extract_sha256_output,
+            verify_sha_ecdsa_application_binding, verify_sha_ecdsa_h8_application_binding,
+            verify_sha_ecdsa_result_binding,
+        },
     };
     use zinc_uair::{
+        UairTrace,
         ideal::{DegreeOneIdeal, rotation::RotationIdeal},
         ideal_collector::IdealOrZero,
     };
@@ -818,6 +834,101 @@ mod tests {
     // hardcoded secp256k1 base prime fits in `Fmod = Uint<FIELD_LIMBS>`.
     const FIELD_LIMBS: usize = U64::LIMBS * 4;
     const DEGREE_PLUS_ONE: usize = 32;
+    const H6_PROOF_FIXTURE_SEED: u64 = 0x4836_5eed;
+
+    struct ShaEcdsaApplicationStatement<'statement, 'trace> {
+        signature_r: &'statement [u8],
+        public_trace: &'statement UairTrace<'trace, ShaEcdsaInt, ShaEcdsaInt, DEGREE_PLUS_ONE>,
+    }
+
+    struct ShaEcdsaH7ApplicationStatement<'statement, 'trace> {
+        signature_r: &'statement [u8],
+        signature_s: &'statement [u8],
+        public_trace: &'statement UairTrace<'trace, ShaEcdsaInt, ShaEcdsaInt, DEGREE_PLUS_ONE>,
+    }
+
+    struct ShaEcdsaH8ApplicationStatement<'statement, 'trace> {
+        message: &'statement [u8],
+        signature_r: &'statement [u8],
+        signature_s: &'statement [u8],
+        q_x: &'statement [u8],
+        q_y: &'statement [u8],
+        public_trace: &'statement UairTrace<'trace, ShaEcdsaInt, ShaEcdsaInt, DEGREE_PLUS_ONE>,
+    }
+
+    fn uint_to_be_bytes(value: &CbUint<EC_FP_INT_LIMBS>) -> [u8; 32] {
+        let mut bytes = [0_u8; 32];
+        for (index, word) in value.as_words().iter().rev().enumerate() {
+            bytes[index * 8..(index + 1) * 8].copy_from_slice(&word.to_be_bytes());
+        }
+        bytes
+    }
+
+    fn signature_r_for_public_trace(
+        public_trace: &UairTrace<'_, ShaEcdsaInt, ShaEcdsaInt, DEGREE_PLUS_ONE>,
+    ) -> [u8; 32] {
+        let final_x = decode_canonical_final_x(
+            &public_trace.int[sha_ecdsa_cols::ECDSA_PA_R_X][zinc_test_uair::sha_ecdsa::FINAL_ROW],
+        )
+        .expect("generated PA_R_X must use the canonical centered encoding");
+        let signature_r = if final_x >= SECP256K1_N_UINT {
+            final_x.wrapping_sub(&SECP256K1_N_UINT)
+        } else {
+            final_x
+        };
+        assert_ne!(
+            signature_r,
+            CbUint::ZERO,
+            "generated ECDSA r must be nonzero"
+        );
+        uint_to_be_bytes(&signature_r)
+    }
+
+    fn add_mod_order(
+        left: &CbUint<EC_FP_INT_LIMBS>,
+        right: &CbUint<EC_FP_INT_LIMBS>,
+    ) -> CbUint<EC_FP_INT_LIMBS> {
+        let left: CbUint<{ EC_FP_INT_LIMBS * 2 }> = left.resize();
+        let right: CbUint<{ EC_FP_INT_LIMBS * 2 }> = right.resize();
+        let sum = left.wrapping_add(&right);
+        let order: CbUint<{ EC_FP_INT_LIMBS * 2 }> = SECP256K1_N_UINT.resize();
+        let order = NonZero::new(order).expect("secp256k1 order is nonzero");
+        let (_, remainder) = sum.div_rem_vartime(&order);
+        remainder.resize()
+    }
+
+    fn h8_message() -> Vec<u8> {
+        let prefix = b"zinc-plus-lab:h8:honest-sha-ecdsa:v1\n";
+        let mut message = prefix.to_vec();
+        message.extend(
+            (0_u16..)
+                .map(|counter| counter as u8)
+                .take(sha256::SEVEN_BLOCK_MESSAGE_BYTES - prefix.len()),
+        );
+        message
+    }
+
+    fn set_h8_scalar_selectors(
+        public_trace: &mut UairTrace<'_, ShaEcdsaInt, ShaEcdsaInt, DEGREE_PLUS_ONE>,
+        u1: &CbUint<EC_FP_INT_LIMBS>,
+        u2: &CbUint<EC_FP_INT_LIMBS>,
+    ) {
+        for row in 0..zinc_test_uair::ecdsa::NUM_SHAMIR_ROUNDS {
+            let bit = zinc_test_uair::ecdsa::NUM_SHAMIR_ROUNDS - 1 - row;
+            let word = bit / 64;
+            let offset = bit % 64;
+            let b1 = ((u1.as_words()[word] >> offset) & 1) == 1;
+            let b2 = ((u2.as_words()[word] >> offset) & 1) == 1;
+            public_trace.int.to_mut()[sha_ecdsa_cols::ECDSA_PA_B1].evaluations[row] =
+                ShaEcdsaInt::from(u32::from(b1));
+            public_trace.int.to_mut()[sha_ecdsa_cols::ECDSA_PA_B2].evaluations[row] =
+                ShaEcdsaInt::from(u32::from(b2));
+            public_trace.int.to_mut()[sha_ecdsa_cols::ECDSA_PA_B1B2].evaluations[row] =
+                ShaEcdsaInt::from(u32::from(b1 && b2));
+            public_trace.int.to_mut()[sha_ecdsa_cols::ECDSA_S_ADD].evaluations[row] =
+                ShaEcdsaInt::from(u32::from(b1 || b2));
+        }
+    }
 
     // Zip+ type parameters.
 
@@ -851,9 +962,10 @@ mod tests {
     };
 
     // Value-sized field with the modulus installed once into `ProofSlot`
-    // (drop-in for `MontyField<FIELD_LIMBS>`; see utils/src/field/runtime_monty.rs).
-    // `F::make_cfg` (called via `secp256k1_field_cfg`) installs the slot before
-    // any field arithmetic runs.
+    // (drop-in for `MontyField<FIELD_LIMBS>`; see
+    // utils/src/field/runtime_monty.rs). `F::make_cfg` (called via
+    // `secp256k1_field_cfg`) installs the slot before any field arithmetic
+    // runs.
     zinc_utils::define_modulus!(ProofSlot, FIELD_LIMBS);
     type F = Fp<ProofSlot, FIELD_LIMBS>;
 
@@ -1040,7 +1152,7 @@ mod tests {
         check_verification: impl Fn(Result<(), ProtocolError<F, IdealOrZero<DegreeOneIdeal<F>>>>),
     ) where
         Zt: ZincTypes<DEGREE_PLUS_ONE>,
-        Zt::Int: num_traits::Zero,
+        Zt::Int: num_traits::Zero + num_traits::One,
         <Zt::BinaryZt as ZipTypes>::Cw: ProjectableToField<F>,
         <Zt::ArbitraryZt as ZipTypes>::Eval: ProjectableToField<F>,
         <Zt::ArbitraryZt as ZipTypes>::Cw: ProjectableToField<F>,
@@ -1355,9 +1467,7 @@ mod tests {
             |res| {
                 assert!(matches!(
                     res.unwrap_err(),
-                    ProtocolError::Resolver(
-                        CombinedPolyResolverError::WrongSumcheckSum { .. }
-                    )
+                    ProtocolError::Resolver(CombinedPolyResolverError::WrongSumcheckSum { .. })
                 ));
             },
         );
@@ -1472,21 +1582,62 @@ mod tests {
     // SHA-ECDSA E2E + tampering tests for the new Step 4.5 layer.
     //
     // These pin the post-Commit-D behaviour:
-    //   * lifted_evals_at_rstar up-half tamper rejected
-    //     with `LiftedAtRStarUpMismatch`.
-    //   * lifted_evals_at_rstar down-half tamper rejected
-    //     with `LiftedAtRStarDownMismatch`.
+    //   * lifted_evals_at_rstar up-half tamper rejected with
+    //     `LiftedAtRStarUpMismatch`.
+    //   * lifted_evals_at_rstar down-half tamper rejected with
+    //     `LiftedAtRStarDownMismatch`.
     //   * SHA `W_W` source tamper rejected upstream of mp_eval (any
     //     `LiftedAtRStar*` variant).
-    //   * No-tamper proof-shape pin: `lifted_evals_at_rstar.len()`
-    //     and `bit_op_down_evals.len()` match the SHA-ECDSA
-    //     signature.
+    //   * No-tamper proof-shape pin: `lifted_evals_at_rstar.len()` and
+    //     `bit_op_down_evals.len()` match the SHA-ECDSA signature.
     //
 
     type ShaEcdsaInt = Int<EC_FP_INT_LIMBS>;
 
-    /// Binary-poly Zip+ types tuned for the wider SHA-ECDSA cell type
-    /// (Int<5>, 320-bit). Mirrors `BinPolyZipTypes` but with a wider
+    fn h7_application_fixture(
+        seed: u64,
+    ) -> (
+        UairTrace<'static, ShaEcdsaInt, ShaEcdsaInt, DEGREE_PLUS_ONE>,
+        [u8; 32],
+        [u8; 32],
+        [u8; 32],
+    ) {
+        let mut rng = StdRng::seed_from_u64(seed);
+        let sha_trace = <Sha256CompressionSliceUair<ShaEcdsaInt> as GenerateRandomTrace<
+            DEGREE_PLUS_ONE,
+        >>::generate_random_trace(SHA_ECDSA_NUM_VARS, &mut rng);
+        let sha_public =
+            sha_trace.public(&<Sha256CompressionSliceUair<ShaEcdsaInt> as Uair>::signature());
+        let digest = extract_sha256_output(&sha_public).expect("generated SHA output must exist");
+        let message_representative = CbUint::from_be_slice(&digest);
+        let reduced_message = if message_representative >= SECP256K1_N_UINT {
+            message_representative.wrapping_sub(&SECP256K1_N_UINT)
+        } else {
+            message_representative
+        };
+        let signature_r = SECP256K1_G_X_UINT;
+        let signature_s = add_mod_order(&reduced_message, &signature_r);
+        assert_ne!(
+            signature_s,
+            CbUint::ZERO,
+            "fixture signature s must be nonzero"
+        );
+        let signature_r = uint_to_be_bytes(&signature_r);
+        let signature_s = uint_to_be_bytes(&signature_s);
+        let trace = build_trace_from_sha_and_signature(
+            SHA_ECDSA_NUM_VARS,
+            sha_trace,
+            (SECP256K1_G_X_UINT, SECP256K1_G_Y_UINT),
+            &signature_r,
+            &signature_s,
+        )
+        .expect("d = k = 1 fixture must build");
+        (trace, signature_r, signature_s, digest)
+    }
+
+    /// Binary-poly Zip+ types tuned for the SHA-ECDSA cell type
+    /// (`Int<EC_FP_INT_LIMBS>` / `Int<4>`, 256-bit). Mirrors
+    /// `BinPolyZipTypes` but with a wider
     /// `CombR` to soak up SHA-ECDSA's per-row inner products.
     #[derive(Debug, Clone)]
     pub struct BinPolyZipTypesShaEcdsa {}
@@ -1544,7 +1695,7 @@ mod tests {
     }
 
     /// Int Zip+ types over `Int<EC_FP_INT_LIMBS>` cells (the ECDSA
-    /// Jacobian columns and the SHA mu_{W,a,e} carries).
+    /// ordinary-projective columns and the SHA integer carries).
     #[derive(Debug, Clone)]
     pub struct IntZipTypesShaEcdsa {}
     impl ZipTypes for IntZipTypesShaEcdsa {
@@ -1711,7 +1862,7 @@ mod tests {
         )
     }
 
-    /// `ZincTypes` bundle wiring SHA-ECDSA's `Int<5>` cells through
+    /// `ZincTypes` bundle wiring SHA-ECDSA's `Int<4>` cells through
     /// IPRS-coded Zip+ commitments. Mirrors `RealEcdsaBenchZincTypes`
     /// from `protocol/benches/e2e.rs` (which already exercises this
     /// configuration in production benchmarks).
@@ -1759,13 +1910,13 @@ mod tests {
     /// type (which doesn't fit the `IdealOrZero<DegreeOneIdeal<F>>`
     /// signature `do_test` hard-codes).
     ///
-    /// `MLE_FIRST` is forced to `false` since SHA-ECDSA has constraints
-    /// up to degree 6 (the ECDSA Y output-selection D4 term), which
-    /// `count_effective_max_degree` reports above 1.
+    /// `MLE_FIRST` is kept `false` here to exercise the combined-projection
+    /// path. The benchmark suite covers the separate MLE-first route.
     #[allow(clippy::result_large_err)]
     fn do_test_sha_ecdsa(
         num_vars: usize,
         tamper: impl Fn(&mut Proof<F>),
+        tamper_public: impl Fn(&mut UairTrace<'_, ShaEcdsaInt, ShaEcdsaInt, DEGREE_PLUS_ONE>),
         check_verification: impl Fn(Result<(), ProtocolError<F, Sha256Ideal<F>>>),
     ) {
         type Zt = TestShaEcdsaZincTypes;
@@ -1784,7 +1935,7 @@ mod tests {
         let trace = U::generate_random_trace(num_vars, &mut rng);
 
         let sig = <U as Uair>::signature();
-        let public_trace = trace.public(&sig);
+        let mut public_trace = trace.public(&sig);
 
         let mut proof = ZincPlusPiop::<Zt, U, F, DEGREE_PLUS_ONE>::prove::<false, CHECKED>(
             &pp,
@@ -1805,11 +1956,9 @@ mod tests {
         assert_eq!(proof, proof_2);
 
         tamper(&mut proof);
+        tamper_public(&mut public_trace);
 
-        let verification_result = ZincPlusPiop::<Zt, U, F, DEGREE_PLUS_ONE>::verify::<
-            _,
-            CHECKED,
-        >(
+        let verification_result = ZincPlusPiop::<Zt, U, F, DEGREE_PLUS_ONE>::verify::<_, CHECKED>(
             &pp,
             proof,
             &public_trace,
@@ -1846,6 +1995,7 @@ mod tests {
                 );
                 p.coeffs.swap(0, 1);
             },
+            |_| {},
             |res| {
                 let err = res.unwrap_err();
                 assert!(
@@ -1860,18 +2010,40 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_e2e_sha_ecdsa_rejects_non_boolean_public_selector() {
+        do_test_sha_ecdsa(
+            SHA_ECDSA_NUM_VARS,
+            |_| {},
+            |public_trace| {
+                public_trace.int.to_mut()[sha_ecdsa_cols::ECDSA_PA_B1].evaluations[17] =
+                    Int::from(2_u32);
+            },
+            |res| {
+                assert!(matches!(
+                    res,
+                    Err(ProtocolError::PublicStructure(
+                        zinc_uair::PublicStructureError::WrongValue {
+                            column: "PA_B1",
+                            row: 17
+                        }
+                    ))
+                ));
+            },
+        );
+    }
+
     /// 4×-folded ShaEcdsa round-trip — binary AND int both quartered
     /// (BinaryPoly<8> / Int<2>) and committed under one Merkle tree
     /// via `MultiZip3`. Prints the serialized proof size.
     #[test]
     fn test_e2e_sha_ecdsa_folded_4x_round_trip() {
-        use crate::prover::prove_folded_4x;
-        use crate::verifier::verify_folded_4x;
+        use crate::{prover::prove_folded_4x, verifier::verify_folded_4x};
 
         type ZtF = TestShaEcdsaFolded4xZincTypes;
         type U = ShaEcdsaUair<ShaEcdsaInt>;
 
-        let mut rng = rng();
+        let mut rng = StdRng::seed_from_u64(H6_PROOF_FIXTURE_SEED);
         let pp = setup_folded_4x_pp_sha_ecdsa(SHA_ECDSA_NUM_VARS);
         let trace = U::generate_random_trace(SHA_ECDSA_NUM_VARS, &mut rng);
         let sig = <U as Uair>::signature();
@@ -1899,10 +2071,12 @@ mod tests {
             serialized_len,
             serialized_len.div_ceil(1024),
         );
+        assert_eq!(
+            serialized_len, 647_518,
+            "fixed-seed folded-4x proof fixture changed",
+        );
         let mut transcript = transcript.into_verification_transcript();
-        let proof_2 = transcript
-            .read()
-            .expect("Failed to deserialize proof");
+        let proof_2 = transcript.read().expect("Failed to deserialize proof");
         assert_eq!(proof, proof_2);
 
         verify_folded_4x::<
@@ -1964,6 +2138,16 @@ mod tests {
             "SHA-ECDSA NUM_BIN drifted: expected 20 binary_poly columns",
         );
         assert_eq!(
+            sig.total_cols().num_int_cols(),
+            42,
+            "SHA-ECDSA NUM_INT drifted: expected 42 integer columns",
+        );
+        assert_eq!(
+            sig.public_cols().num_int_cols(),
+            24,
+            "SHA-ECDSA NUM_INT_PUB drifted: expected 24 public integer columns",
+        );
+        assert_eq!(
             num_bit_op, 11,
             "SHA-ECDSA bit_op_specs.len() drifted: expected 11",
         );
@@ -1974,7 +2158,7 @@ mod tests {
         );
 
         // Round-trip a real proof and pin the post-rewrite proof size.
-        let mut rng = rng();
+        let mut rng = StdRng::seed_from_u64(H6_PROOF_FIXTURE_SEED);
         let pp = setup_pp::<Zt>(
             SHA_ECDSA_NUM_VARS,
             (
@@ -2002,17 +2186,748 @@ mod tests {
 
         let total_proof_bytes = proof.get_num_bytes();
         println!("total proof bytes: {total_proof_bytes}");
+        assert_eq!(
+            total_proof_bytes, 845_098,
+            "fixed-seed flat proof fixture changed",
+        );
 
-        // Verifier still accepts the un-tampered proof.
+        let signature_r = signature_r_for_public_trace(&public_trace);
+
+        // The lower-level proof API has no signature-r argument. It proves the
+        // UAIR relation but does not, by itself, claim ECDSA verification.
         ZincPlusPiop::<Zt, U, F, DEGREE_PLUS_ONE>::verify::<_, CHECKED>(
             &pp,
-            proof,
+            proof.clone(),
             &public_trace,
             SHA_ECDSA_NUM_VARS,
             project_scalar_fn,
             sha256_test_project_ideal,
         )
-        .expect("Verifier rejected an honest SHA-ECDSA proof");
+        .expect("lower-level verifier rejected the honest UAIR proof");
+
+        let mut wrong_r = [0_u8; 32];
+        wrong_r[31] = if signature_r[31] == 1 && signature_r[..31].iter().all(|&b| b == 0) {
+            2
+        } else {
+            1
+        };
+        let protocol_called = Cell::new(false);
+        let wrong_r_result = application::verify_application(
+            application::ApplicationVerificationInput::new(
+                ShaEcdsaApplicationStatement {
+                    signature_r: &wrong_r,
+                    public_trace: &public_trace,
+                },
+                proof.clone(),
+            ),
+            |statement| {
+                verify_sha_ecdsa_result_binding(statement.signature_r, statement.public_trace)
+                    .map(|_| ())
+            },
+            |proof, statement| {
+                protocol_called.set(true);
+                ZincPlusPiop::<Zt, U, F, DEGREE_PLUS_ONE>::verify::<_, CHECKED>(
+                    &pp,
+                    proof,
+                    statement.public_trace,
+                    SHA_ECDSA_NUM_VARS,
+                    project_scalar_fn,
+                    sha256_test_project_ideal,
+                )
+            },
+        );
+        assert!(matches!(
+            wrong_r_result,
+            Err(application::ApplicationVerificationError::ResultBinding(
+                EcdsaResultBindingError::ResultMismatch
+            ))
+        ));
+        assert!(
+            !protocol_called.get(),
+            "binding failure should reject before PCS work"
+        );
+
+        let mut mutated_x_public = public_trace.clone();
+        mutated_x_public.int.to_mut()[sha_ecdsa_cols::ECDSA_PA_R_X].evaluations
+            [zinc_test_uair::sha_ecdsa::FINAL_ROW] = Int::from(0_u32);
+        let mutated_x_result = application::verify_application(
+            application::ApplicationVerificationInput::new(
+                ShaEcdsaApplicationStatement {
+                    signature_r: &signature_r,
+                    public_trace: &mutated_x_public,
+                },
+                proof.clone(),
+            ),
+            |statement| {
+                verify_sha_ecdsa_result_binding(statement.signature_r, statement.public_trace)
+                    .map(|_| ())
+            },
+            |proof, statement| {
+                ZincPlusPiop::<Zt, U, F, DEGREE_PLUS_ONE>::verify::<_, CHECKED>(
+                    &pp,
+                    proof,
+                    statement.public_trace,
+                    SHA_ECDSA_NUM_VARS,
+                    project_scalar_fn,
+                    sha256_test_project_ideal,
+                )
+            },
+        );
+        assert!(matches!(
+            mutated_x_result,
+            Err(application::ApplicationVerificationError::ResultBinding(
+                EcdsaResultBindingError::ResultMismatch
+            ))
+        ));
+
+        let mut mutated_z_inv_public = public_trace.clone();
+        mutated_z_inv_public.int.to_mut()[sha_ecdsa_cols::ECDSA_PA_Z_INV].evaluations
+            [zinc_test_uair::sha_ecdsa::FINAL_ROW] = Int::from(0_u32);
+        let mutated_z_inv_result = application::verify_application(
+            application::ApplicationVerificationInput::new(
+                ShaEcdsaApplicationStatement {
+                    signature_r: &signature_r,
+                    public_trace: &mutated_z_inv_public,
+                },
+                proof.clone(),
+            ),
+            |statement| {
+                verify_sha_ecdsa_result_binding(statement.signature_r, statement.public_trace)
+                    .map(|_| ())
+            },
+            |proof, statement| {
+                ZincPlusPiop::<Zt, U, F, DEGREE_PLUS_ONE>::verify::<_, CHECKED>(
+                    &pp,
+                    proof,
+                    statement.public_trace,
+                    SHA_ECDSA_NUM_VARS,
+                    project_scalar_fn,
+                    sha256_test_project_ideal,
+                )
+            },
+        );
+        assert!(matches!(
+            mutated_z_inv_result,
+            Err(application::ApplicationVerificationError::Protocol(_))
+        ));
+
+        application::verify_application(
+            application::ApplicationVerificationInput::new(
+                ShaEcdsaApplicationStatement {
+                    signature_r: &signature_r,
+                    public_trace: &public_trace,
+                },
+                proof,
+            ),
+            |statement| {
+                verify_sha_ecdsa_result_binding(statement.signature_r, statement.public_trace)
+                    .map(|_| ())
+            },
+            |proof, statement| {
+                ZincPlusPiop::<Zt, U, F, DEGREE_PLUS_ONE>::verify::<_, CHECKED>(
+                    &pp,
+                    proof,
+                    statement.public_trace,
+                    SHA_ECDSA_NUM_VARS,
+                    project_scalar_fn,
+                    sha256_test_project_ideal,
+                )
+            },
+        )
+        .expect("typed application verifier rejected an honest SHA-ECDSA proof");
+    }
+
+    #[test]
+    fn test_e2e_sha_ecdsa_plus_order_on_curve_round_trip() {
+        type Zt = TestShaEcdsaZincTypes;
+        type U = ShaEcdsaUair<ShaEcdsaInt>;
+
+        // The smallest nonzero plus-order representative with an affine point:
+        // x = n + 2 and y^2 = x^3 + 7 mod p. With u1=0 and u2=1, the
+        // Shamir result is exactly Q, so the application must take r+n.
+        let q = (
+            CbUint::from_be_hex("fffffffffffffffffffffffffffffffebaaedce6af48a03bbfd25e8cd0364143"),
+            CbUint::from_be_hex("36b1aa62eb77c1973025cbcbea9740eed8eacdab8772268b395064453269d1d3"),
+        );
+        assert!(is_secp256k1_affine_point(&q.0, &q.1));
+
+        let mut rng = StdRng::seed_from_u64(H6_PROOF_FIXTURE_SEED ^ 1);
+        let pp = setup_pp::<Zt>(
+            SHA_ECDSA_NUM_VARS,
+            (
+                make_iprs(SHA_ECDSA_NUM_VARS),
+                make_iprs(SHA_ECDSA_NUM_VARS),
+                make_iprs(SHA_ECDSA_NUM_VARS),
+            ),
+        );
+        let trace = build_trace_from_ecdsa_scalars::<ShaEcdsaInt, _>(
+            SHA_ECDSA_NUM_VARS,
+            &mut rng,
+            q,
+            CbUint::ZERO,
+            CbUint::ONE,
+        )
+        .expect("plus-order public key must be valid");
+        let public_trace = trace.public(&<U as Uair>::signature());
+        let signature_r = uint_to_be_bytes(&CbUint::from_u64(2));
+        assert_eq!(
+            verify_sha_ecdsa_result_binding(&signature_r, &public_trace),
+            Ok(EcdsaResultBranch::PlusOrder),
+        );
+
+        let proof = ZincPlusPiop::<Zt, U, F, DEGREE_PLUS_ONE>::prove::<false, CHECKED>(
+            &pp,
+            &trace,
+            SHA_ECDSA_NUM_VARS,
+            project_scalar_fn,
+        )
+        .expect("plus-order prover failed");
+
+        // Both x=r and x=r+n satisfy the typed SEC 1 result binding when
+        // they are below p. The proof must still own which representative
+        // the Shamir computation produced.
+        let mut direct_representative = public_trace.clone();
+        direct_representative.int.to_mut()[sha_ecdsa_cols::ECDSA_PA_R_X].evaluations
+            [zinc_test_uair::sha_ecdsa::FINAL_ROW] = Int::from(2_u32);
+        assert_eq!(
+            verify_sha_ecdsa_result_binding(&signature_r, &direct_representative),
+            Ok(EcdsaResultBranch::Direct),
+        );
+        assert!(
+            ZincPlusPiop::<Zt, U, F, DEGREE_PLUS_ONE>::verify::<_, CHECKED>(
+                &pp,
+                proof.clone(),
+                &direct_representative,
+                SHA_ECDSA_NUM_VARS,
+                project_scalar_fn,
+                sha256_test_project_ideal,
+            )
+            .is_err(),
+            "the proof must reject the other binding-valid x representative",
+        );
+
+        application::verify_application(
+            application::ApplicationVerificationInput::new(
+                ShaEcdsaApplicationStatement {
+                    signature_r: &signature_r,
+                    public_trace: &public_trace,
+                },
+                proof,
+            ),
+            |statement| {
+                verify_sha_ecdsa_result_binding(statement.signature_r, statement.public_trace)
+                    .map(|_| ())
+            },
+            |proof, statement| {
+                ZincPlusPiop::<Zt, U, F, DEGREE_PLUS_ONE>::verify::<_, CHECKED>(
+                    &pp,
+                    proof,
+                    statement.public_trace,
+                    SHA_ECDSA_NUM_VARS,
+                    project_scalar_fn,
+                    sha256_test_project_ideal,
+                )
+            },
+        )
+        .expect("typed application verifier rejected the on-curve plus-order proof");
+    }
+
+    #[test]
+    fn test_e2e_sha_ecdsa_h7_scalar_binding_round_trip() {
+        type Zt = TestShaEcdsaZincTypes;
+        type U = ShaEcdsaUair<ShaEcdsaInt>;
+
+        let pp = setup_pp::<Zt>(
+            SHA_ECDSA_NUM_VARS,
+            (
+                make_iprs(SHA_ECDSA_NUM_VARS),
+                make_iprs(SHA_ECDSA_NUM_VARS),
+                make_iprs(SHA_ECDSA_NUM_VARS),
+            ),
+        );
+        let (trace, signature_r, signature_s, digest) = h7_application_fixture(0x4837_7001);
+        let public_trace = trace.public(&<U as Uair>::signature());
+        let binding =
+            verify_sha_ecdsa_application_binding(&signature_r, &signature_s, &public_trace)
+                .expect("deterministic H7 fixture must satisfy both application postconditions");
+        assert_eq!(binding.scalars.digest, digest);
+        assert_eq!(binding.result_branch, EcdsaResultBranch::Direct);
+
+        let proof = ZincPlusPiop::<Zt, U, F, DEGREE_PLUS_ONE>::prove::<false, CHECKED>(
+            &pp,
+            &trace,
+            SHA_ECDSA_NUM_VARS,
+            project_scalar_fn,
+        )
+        .expect("H7 fixture prover failed");
+        println!("H7 flat proof bytes: {}", proof.get_num_bytes());
+
+        application::verify_application(
+            application::ApplicationVerificationInput::new(
+                ShaEcdsaH7ApplicationStatement {
+                    signature_r: &signature_r,
+                    signature_s: &signature_s,
+                    public_trace: &public_trace,
+                },
+                proof.clone(),
+            ),
+            |statement| {
+                verify_sha_ecdsa_application_binding(
+                    statement.signature_r,
+                    statement.signature_s,
+                    statement.public_trace,
+                )
+                .map(|_| ())
+            },
+            |proof, statement| {
+                ZincPlusPiop::<Zt, U, F, DEGREE_PLUS_ONE>::verify::<_, CHECKED>(
+                    &pp,
+                    proof,
+                    statement.public_trace,
+                    SHA_ECDSA_NUM_VARS,
+                    project_scalar_fn,
+                    sha256_test_project_ideal,
+                )
+            },
+        )
+        .expect("typed H7 application verifier rejected an honest proof");
+
+        let signature_s_value = CbUint::from_be_slice(&signature_s);
+        let wrong_s_value = if signature_s_value == SECP256K1_N_UINT.wrapping_sub(&CbUint::ONE) {
+            signature_s_value.wrapping_sub(&CbUint::ONE)
+        } else {
+            signature_s_value.wrapping_add(&CbUint::ONE)
+        };
+        let wrong_s = uint_to_be_bytes(&wrong_s_value);
+        let protocol_called = Cell::new(false);
+        let wrong_s_result = application::verify_application(
+            application::ApplicationVerificationInput::new(
+                ShaEcdsaH7ApplicationStatement {
+                    signature_r: &signature_r,
+                    signature_s: &wrong_s,
+                    public_trace: &public_trace,
+                },
+                proof.clone(),
+            ),
+            |statement| {
+                verify_sha_ecdsa_application_binding(
+                    statement.signature_r,
+                    statement.signature_s,
+                    statement.public_trace,
+                )
+                .map(|_| ())
+            },
+            |_, _| {
+                protocol_called.set(true);
+                Ok::<_, ProtocolError<F, Sha256Ideal<F>>>(())
+            },
+        );
+        assert!(matches!(
+            wrong_s_result,
+            Err(application::ApplicationVerificationError::ResultBinding(
+                ShaEcdsaApplicationBindingError::Scalar(
+                    ShaEcdsaScalarBindingError::ScalarBitMismatch { .. }
+                )
+            ))
+        ));
+        assert!(
+            !protocol_called.get(),
+            "wrong s must reject before PCS verification"
+        );
+
+        let mut disconnected_sha = public_trace.clone();
+        disconnected_sha.int.to_mut()[sha_ecdsa_cols::SHA_S_INIT_PREFIX].evaluations[0] =
+            Int::from(0_u32);
+        let protocol_called = Cell::new(false);
+        let disconnected_result = application::verify_application(
+            application::ApplicationVerificationInput::new(
+                ShaEcdsaH7ApplicationStatement {
+                    signature_r: &signature_r,
+                    signature_s: &signature_s,
+                    public_trace: &disconnected_sha,
+                },
+                proof.clone(),
+            ),
+            |statement| {
+                verify_sha_ecdsa_application_binding(
+                    statement.signature_r,
+                    statement.signature_s,
+                    statement.public_trace,
+                )
+                .map(|_| ())
+            },
+            |_, _| {
+                protocol_called.set(true);
+                Ok::<_, ProtocolError<F, Sha256Ideal<F>>>(())
+            },
+        );
+        assert!(matches!(
+            disconnected_result,
+            Err(application::ApplicationVerificationError::ResultBinding(
+                ShaEcdsaApplicationBindingError::Scalar(
+                    ShaEcdsaScalarBindingError::ShaStructureMismatch {
+                        column: "SHA_S_INIT_PREFIX",
+                        row: 0,
+                    }
+                )
+            ))
+        ));
+        assert!(
+            !protocol_called.get(),
+            "disconnected SHA selectors must reject before PCS verification"
+        );
+
+        // A second, internally consistent statement passes both public
+        // postconditions. The first statement's proof must still reject it.
+        let (other_trace, other_r, other_s, _) = h7_application_fixture(0x4837_7002);
+        let other_public = other_trace.public(&<U as Uair>::signature());
+        verify_sha_ecdsa_application_binding(&other_r, &other_s, &other_public)
+            .expect("second application statement must be internally consistent");
+        let mismatched_statement = application::verify_application(
+            application::ApplicationVerificationInput::new(
+                ShaEcdsaH7ApplicationStatement {
+                    signature_r: &other_r,
+                    signature_s: &other_s,
+                    public_trace: &other_public,
+                },
+                proof,
+            ),
+            |statement| {
+                verify_sha_ecdsa_application_binding(
+                    statement.signature_r,
+                    statement.signature_s,
+                    statement.public_trace,
+                )
+                .map(|_| ())
+            },
+            |proof, statement| {
+                ZincPlusPiop::<Zt, U, F, DEGREE_PLUS_ONE>::verify::<_, CHECKED>(
+                    &pp,
+                    proof,
+                    statement.public_trace,
+                    SHA_ECDSA_NUM_VARS,
+                    project_scalar_fn,
+                    sha256_test_project_ideal,
+                )
+            },
+        );
+        assert!(matches!(
+            mismatched_statement,
+            Err(application::ApplicationVerificationError::Protocol(_))
+        ));
+    }
+
+    #[test]
+    fn test_e2e_sha_ecdsa_h8_complete_statement_and_proof_ownership() {
+        type Zt = TestShaEcdsaZincTypes;
+        type U = ShaEcdsaUair<ShaEcdsaInt>;
+
+        let message = h8_message();
+        let signature_r = uint_to_be_bytes(&CbUint::from_be_hex(
+            "5CD26EE278677AEBEC2C8E7486023D9299EF1B5705D3BE62531E98247E5E8302",
+        ));
+        let signature_s = uint_to_be_bytes(&CbUint::from_be_hex(
+            "7835018BB2CFF73325391068D670363C81AF019C87BC2CAC96672133C2B59568",
+        ));
+        let q = (
+            CbUint::from_be_hex(
+                "C6047F9441ED7D6D3045406E95C07CD85C778E4B8CEF3CA7ABAC09B95C709EE5",
+            ),
+            CbUint::from_be_hex(
+                "1AE168FEA63DC339A3C58419466CEAEEF7F632653266D0E1236431A950CFE52A",
+            ),
+        );
+        let q_x = uint_to_be_bytes(&q.0);
+        let q_y = uint_to_be_bytes(&q.1);
+        let trace = build_trace_from_message_and_signature::<ShaEcdsaInt>(
+            SHA_ECDSA_NUM_VARS,
+            &message,
+            q,
+            &signature_r,
+            &signature_s,
+        )
+        .expect("frozen libsecp256k1 H8 statement must build");
+        let sig = <U as Uair>::signature();
+        let public_trace = trace.public(&sig);
+        let binding = verify_sha_ecdsa_h8_application_binding(
+            &message,
+            &signature_r,
+            &signature_s,
+            &q_x,
+            &q_y,
+            &public_trace,
+        )
+        .expect("frozen H8 statement must satisfy every typed binding");
+        assert_eq!(
+            binding.scalars.digest,
+            uint_to_be_bytes(&CbUint::from_be_hex(
+                "E2D0FA71422BD33D792095FECF1D3CE6D13906E2627EE58C11E8C56CA0039188",
+            )),
+        );
+        assert_eq!(binding.result_branch, EcdsaResultBranch::Direct);
+
+        let pp = setup_pp::<Zt>(
+            SHA_ECDSA_NUM_VARS,
+            (
+                make_iprs(SHA_ECDSA_NUM_VARS),
+                make_iprs(SHA_ECDSA_NUM_VARS),
+                make_iprs(SHA_ECDSA_NUM_VARS),
+            ),
+        );
+        let proof = ZincPlusPiop::<Zt, U, F, DEGREE_PLUS_ONE>::prove::<false, CHECKED>(
+            &pp,
+            &trace,
+            SHA_ECDSA_NUM_VARS,
+            project_scalar_fn,
+        )
+        .expect("H8 prover failed");
+
+        let mut transcript = PcsProverTranscript::new_from_commitments(std::iter::empty());
+        transcript.write(&proof).expect("H8 proof must serialize");
+        let raw_bytes = transcript.stream.get_ref().len();
+        let zstd_bytes = zstd::encode_all(transcript.stream.get_ref().as_slice(), 3)
+            .expect("H8 proof compression must succeed")
+            .len();
+        let component_bytes = proof.get_num_bytes();
+        assert_eq!(
+            raw_bytes,
+            component_bytes + core::mem::size_of::<u32>(),
+            "serialized Proof adds one u32 Zip-payload length prefix",
+        );
+        println!(
+            "H8 flat proof bytes: serialized={raw_bytes} components={component_bytes} zstd-3={zstd_bytes}",
+        );
+
+        application::verify_application(
+            application::ApplicationVerificationInput::new(
+                ShaEcdsaH8ApplicationStatement {
+                    message: &message,
+                    signature_r: &signature_r,
+                    signature_s: &signature_s,
+                    q_x: &q_x,
+                    q_y: &q_y,
+                    public_trace: &public_trace,
+                },
+                proof.clone(),
+            ),
+            |statement| {
+                verify_sha_ecdsa_h8_application_binding(
+                    statement.message,
+                    statement.signature_r,
+                    statement.signature_s,
+                    statement.q_x,
+                    statement.q_y,
+                    statement.public_trace,
+                )
+                .map(|_| ())
+            },
+            |proof, statement| {
+                ZincPlusPiop::<Zt, U, F, DEGREE_PLUS_ONE>::verify::<_, CHECKED>(
+                    &pp,
+                    proof,
+                    statement.public_trace,
+                    SHA_ECDSA_NUM_VARS,
+                    project_scalar_fn,
+                    sha256_test_project_ideal,
+                )
+            },
+        )
+        .expect("typed H8 verifier rejected the frozen statement");
+
+        // The typed verifier intentionally does not re-hash natively. Change
+        // the proof-owned digest and recompute every public scalar selector:
+        // the cheap binding remains internally consistent, but the old proof
+        // must reject the altered trace.
+        let mut changed_digest = public_trace.clone();
+        let output_row = sha256::cols::NUM_COMPRESSIONS * sha256::cols::ROWS_PER_COMP;
+        changed_digest.binary_poly.to_mut()[sha_ecdsa_cols::PA_E].evaluations[output_row] =
+            0_u32.into();
+        let changed_digest_bytes =
+            extract_sha256_output(&changed_digest).expect("mutated output must remain readable");
+        assert_ne!(changed_digest_bytes, binding.scalars.digest);
+        let changed_scalars = derive_ecdsa_verification_scalars(
+            changed_digest_bytes,
+            &signature_r,
+            &signature_s,
+        )
+        .expect("frozen signature remains canonically encoded");
+        set_h8_scalar_selectors(&mut changed_digest, &changed_scalars.u1, &changed_scalars.u2);
+        verify_sha_ecdsa_h8_application_binding(
+            &message,
+            &signature_r,
+            &signature_s,
+            &q_x,
+            &q_y,
+            &changed_digest,
+        )
+        .expect("changed digest and selectors must pass the non-decorative typed boundary");
+        assert!(
+            ZincPlusPiop::<Zt, U, F, DEGREE_PLUS_ONE>::verify::<_, CHECKED>(
+                &pp,
+                proof.clone(),
+                &changed_digest,
+                SHA_ECDSA_NUM_VARS,
+                project_scalar_fn,
+                sha256_test_project_ideal,
+            )
+            .is_err(),
+            "the original proof must own the SHA output",
+        );
+
+        // Change one non-initial compression input and its feed-forward
+        // junction copy together. The cheap H8 binding sees a consistent
+        // public copy pair, so only the proof-enforced previous feed-forward
+        // and current compression constraints can reject the substitution.
+        let mut changed_chain_copy = public_trace.clone();
+        let input_row = sha256::cols::ROWS_PER_COMP;
+        let junction_row = input_row + sha256::cols::ROUNDS_PER_COMP;
+        let original_input = changed_chain_copy.binary_poly[sha_ecdsa_cols::PA_A].evaluations
+            [input_row]
+            .clone();
+        let original_junction =
+            changed_chain_copy.binary_poly[sha_ecdsa_cols::PA_A].evaluations[junction_row].clone();
+        assert_eq!(original_input, original_junction);
+        let replacement = 0_u32.into();
+        assert_ne!(original_input, replacement);
+        changed_chain_copy.binary_poly.to_mut()[sha_ecdsa_cols::PA_A].evaluations[input_row] =
+            replacement.clone();
+        changed_chain_copy.binary_poly.to_mut()[sha_ecdsa_cols::PA_A].evaluations[junction_row] =
+            replacement;
+        verify_sha_ecdsa_h8_application_binding(
+            &message,
+            &signature_r,
+            &signature_s,
+            &q_x,
+            &q_y,
+            &changed_chain_copy,
+        )
+        .expect("a consistently changed init/junction copy must pass the typed boundary");
+        assert!(
+            ZincPlusPiop::<Zt, U, F, DEGREE_PLUS_ONE>::verify::<_, CHECKED>(
+                &pp,
+                proof.clone(),
+                &changed_chain_copy,
+                SHA_ECDSA_NUM_VARS,
+                project_scalar_fn,
+                sha256_test_project_ideal,
+            )
+            .is_err(),
+            "the original proof must own a consistent init/junction substitution",
+        );
+
+        // Replace Q and G+Q together with another valid pair. This passes the
+        // typed key check and leaves the old result cell untouched; only the
+        // proof can reject the now-inconsistent Shamir computation.
+        let generator_q = (SECP256K1_G_X_UINT, SECP256K1_G_Y_UINT);
+        let generator_trace = build_trace_from_message_and_signature::<ShaEcdsaInt>(
+            SHA_ECDSA_NUM_VARS,
+            &message,
+            generator_q,
+            &signature_r,
+            &signature_s,
+        )
+        .expect("generator public key must build");
+        let generator_public = generator_trace.public(&sig);
+        let mut changed_key = public_trace.clone();
+        for column in [
+            sha_ecdsa_cols::ECDSA_PA_QX,
+            sha_ecdsa_cols::ECDSA_PA_QY,
+            sha_ecdsa_cols::ECDSA_PA_QGX,
+            sha_ecdsa_cols::ECDSA_PA_QGY,
+        ] {
+            changed_key.int.to_mut()[column] = generator_public.int[column].clone();
+        }
+        let generator_x = uint_to_be_bytes(&generator_q.0);
+        let generator_y = uint_to_be_bytes(&generator_q.1);
+        verify_sha_ecdsa_h8_application_binding(
+            &message,
+            &signature_r,
+            &signature_s,
+            &generator_x,
+            &generator_y,
+            &changed_key,
+        )
+        .expect("changed Q/G+Q pair must pass the typed boundary");
+        assert!(
+            ZincPlusPiop::<Zt, U, F, DEGREE_PLUS_ONE>::verify::<_, CHECKED>(
+                &pp,
+                proof.clone(),
+                &changed_key,
+                SHA_ECDSA_NUM_VARS,
+                project_scalar_fn,
+                sha256_test_project_ideal,
+            )
+            .is_err(),
+            "the original proof must own Q and G+Q",
+        );
+
+        // Build and prove a second valid 400-byte statement using d=k=1.
+        // Its own proof verifies, while the frozen statement's proof rejects
+        // the alternate public trace.
+        let mut other_message = message.clone();
+        *other_message.last_mut().expect("H8 message is nonempty") ^= 1;
+        let other_sha = sha256::build_trace_from_message::<ShaEcdsaInt>(
+            SHA_ECDSA_NUM_VARS,
+            &other_message,
+        )
+        .expect("alternate 400-byte message must build");
+        let other_sha_public =
+            other_sha.public(&<Sha256CompressionSliceUair<ShaEcdsaInt> as Uair>::signature());
+        let other_digest =
+            extract_sha256_output(&other_sha_public).expect("alternate digest must exist");
+        let other_r_value = SECP256K1_G_X_UINT;
+        let other_s_value = add_mod_order(
+            &CbUint::from_be_slice(&other_digest),
+            &other_r_value,
+        );
+        let other_r = uint_to_be_bytes(&other_r_value);
+        let other_s = uint_to_be_bytes(&other_s_value);
+        let other_trace = build_trace_from_message_and_signature::<ShaEcdsaInt>(
+            SHA_ECDSA_NUM_VARS,
+            &other_message,
+            generator_q,
+            &other_r,
+            &other_s,
+        )
+        .expect("alternate d=k=1 statement must build");
+        let other_public = other_trace.public(&sig);
+        verify_sha_ecdsa_h8_application_binding(
+            &other_message,
+            &other_r,
+            &other_s,
+            &generator_x,
+            &generator_y,
+            &other_public,
+        )
+        .expect("alternate statement must pass every typed binding");
+        let other_proof = ZincPlusPiop::<Zt, U, F, DEGREE_PLUS_ONE>::prove::<false, CHECKED>(
+            &pp,
+            &other_trace,
+            SHA_ECDSA_NUM_VARS,
+            project_scalar_fn,
+        )
+        .expect("alternate H8 prover failed");
+        ZincPlusPiop::<Zt, U, F, DEGREE_PLUS_ONE>::verify::<_, CHECKED>(
+            &pp,
+            other_proof,
+            &other_public,
+            SHA_ECDSA_NUM_VARS,
+            project_scalar_fn,
+            sha256_test_project_ideal,
+        )
+        .expect("alternate H8 proof must verify against its own statement");
+        assert!(
+            ZincPlusPiop::<Zt, U, F, DEGREE_PLUS_ONE>::verify::<_, CHECKED>(
+                &pp,
+                proof,
+                &other_public,
+                SHA_ECDSA_NUM_VARS,
+                project_scalar_fn,
+                sha256_test_project_ideal,
+            )
+            .is_err(),
+            "a proof must not transfer between two valid H8 statements",
+        );
     }
 
     #[test]
@@ -2038,9 +2953,9 @@ mod tests {
     //
 
     /// Half-degree binary Zip+ types for the split commitment side of the
-    /// folded path. Mirrors [`BinPolyZipTypes`] but with `Eval = BinaryPoly<16>`
-    /// and `Cw` over `DensePolynomial<i64, 16>`, so the PCS commits the
-    /// post-split BinaryPoly<16> witnesses.
+    /// folded path. Mirrors [`BinPolyZipTypes`] but with `Eval =
+    /// BinaryPoly<16>` and `Cw` over `DensePolynomial<i64, 16>`, so the PCS
+    /// commits the post-split BinaryPoly<16> witnesses.
     const HALF_DEGREE_PLUS_ONE: usize = 16;
 
     #[derive(Debug, Clone)]
@@ -2147,8 +3062,7 @@ mod tests {
     /// the extended point `(r_0 ‖ γ)`.
     #[test]
     fn test_e2e_folded_binary_decomposition() {
-        use crate::prover::prove_folded;
-        use crate::verifier::verify_folded;
+        use crate::{prover::prove_folded, verifier::verify_folded};
 
         let num_vars = 8;
         let mut rng = rng();
@@ -2219,5 +3133,4 @@ mod tests {
         >;
         type ArrCombRDotChal = MBSInnerProduct;
     }
-
 }
