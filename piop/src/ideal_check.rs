@@ -415,18 +415,40 @@ where
 
         let ideal_collector = collect_ideals::<U>(num_constraints);
 
-        // Only check non-trivial ideals. For assert_zero constraints
-        // the ideal is the zero ideal and the combined polynomial
-        // value is zero by construction; the sumcheck that follows
-        // verifies consistency of the claimed evaluations with the
-        // actual trace.
-        let (non_trivial_ideals, non_trivial_values): (Vec<_>, Vec<_>) = ideal_collector
+        if ideal_collector.ideals.len() != combined_mle_values.len() {
+            return Err(IdealCheckError::IdealCollectorError(
+                BatchedIdealCheckError::LengthMismatch {
+                    num_ideals: ideal_collector.ideals.len(),
+                    provided_values: combined_mle_values.len(),
+                },
+            ));
+        }
+
+        // Check zero ideals directly and project only non-trivial ideals.
+        // The later sumcheck binds each claimed value to the committed trace,
+        // but consistency alone does not require an `assert_zero` expression
+        // to vanish. Projector callbacks historically treated `Zero` as
+        // unreachable, so invoking them here would also break custom ideals.
+        let mut non_trivial_ideals = Vec::new();
+        let mut non_trivial_values = Vec::new();
+        for (constraint_index, (ideal, value)) in ideal_collector
             .ideals
             .iter()
             .zip(combined_mle_values.iter())
-            .filter(|(ideal, _)| !ideal.is_zero_ideal())
-            .map(|(ideal, value)| (ideal_over_f_from_ref(ideal), value.clone()))
-            .unzip();
+            .enumerate()
+        {
+            if ideal.is_zero_ideal() {
+                if value.degree().is_some() {
+                    return Err(IdealCheckError::ZeroIdealViolation {
+                        constraint_index,
+                        value: value.clone(),
+                    });
+                }
+            } else {
+                non_trivial_ideals.push(ideal_over_f_from_ref(ideal));
+                non_trivial_values.push(value.clone());
+            }
+        }
 
         batched_ideal_check(&non_trivial_ideals, &non_trivial_values)?;
 
@@ -443,6 +465,11 @@ pub enum IdealCheckError<F: PrimeField, I> {
     MleEvaluationError(#[from] EvaluationError),
     #[error("mle evaluation ideal check failure: {0}")]
     IdealCollectorError(#[from] BatchedIdealCheckError<DynamicPolynomialF<F>, I>),
+    #[error("claimed assert-zero value {constraint_index} is nonzero: {value}")]
+    ZeroIdealViolation {
+        constraint_index: usize,
+        value: DynamicPolynomialF<F>,
+    },
     #[error("`eq` polynomial construction failure: {0}")]
     EqPolyConstructionError(#[from] PolyArithErrors),
 }
@@ -577,5 +604,40 @@ mod tests {
             num_vars,
             |_ideal_over_ring| IdealOrZero::<DegreeOneIdeal<_>>::zero(),
         );
+    }
+
+    #[test]
+    fn verifier_rejects_nonzero_claim_for_assert_zero_constraint() {
+        type U = TestUairSimpleMultiplication<Int<5>>;
+
+        let num_vars = 2;
+        let field_cfg = test_config();
+        let mut rng = rng();
+        let transcript = Blake3Transcript::new();
+        let (mut proof, ..) = run_ideal_check_prover_combined::<U, 32>(
+            num_vars,
+            &U::generate_random_trace(num_vars, &mut rng),
+            &mut transcript.clone(),
+        );
+        proof.combined_mle_values[0] =
+            DynamicPolynomialF::constant_poly(MontyField::one_with_cfg(&field_cfg));
+
+        let error = U::verify_as_subprotocol(
+            &mut transcript.clone(),
+            proof,
+            count_constraints::<U>(),
+            num_vars,
+            |_ideal| IdealOrZero::<DegreeOneIdeal<_>>::zero(),
+            &field_cfg,
+        )
+        .expect_err("a nonzero assert-zero claim must be rejected");
+
+        assert!(matches!(
+            error,
+            IdealCheckError::ZeroIdealViolation {
+                constraint_index: 0,
+                ..
+            }
+        ));
     }
 }

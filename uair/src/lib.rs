@@ -1002,6 +1002,19 @@ pub enum PublicStructureError {
         /// Number of columns supplied by the verifier input.
         actual: usize,
     },
+    /// One public MLE disagrees with the statement's declared hypercube
+    /// dimension. Reject this before any verifier-side row indexing.
+    #[error(
+        "public {column_family} column {column_index} has num_vars={actual_num_vars} and {actual_rows} rows; expected num_vars={expected_num_vars} and {expected_rows} rows"
+    )]
+    WrongColumnShape {
+        column_family: &'static str,
+        column_index: usize,
+        expected_num_vars: usize,
+        actual_num_vars: usize,
+        expected_rows: usize,
+        actual_rows: usize,
+    },
     /// A public column expected to be zero on a particular row was
     /// non-zero. Carries enough context to localise the failure.
     #[error("public column '{column}' must be zero at row {row}, but is non-zero")]

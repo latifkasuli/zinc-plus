@@ -787,18 +787,36 @@ mod tests {
     use zinc_piop::{
         combined_poly_resolver::CombinedPolyResolverError, multipoint_eval::MultipointEvalError,
     };
-    use zinc_poly::univariate::{binary::BinaryPolyInnerProduct, dense::DensePolyInnerProduct};
+    use zinc_poly::univariate::{
+        binary::{BinaryPoly, BinaryPolyInnerProduct},
+        dense::DensePolyInnerProduct,
+    };
     use zinc_primality::MillerRabin;
     use zinc_test_uair::{
         BigLinearUair, BigLinearUairWithPublicInput, BinaryDecompositionUair, BitOpRotUair,
-        EC_FP_INT_LIMBS, GenerateRandomTrace, Sha256CompressionSliceUair, Sha256Ideal,
-        ShaEcdsaUair, TestUairMixedDegrees, TestUairMixedShifts, TestUairNoMultiplication,
-        TestUairSimpleMultiplication, sha256,
+        EC_FP_INT_LIMBS, GenerateRandomTrace, PrivateEcdsaScalarsUair,
+        PrivateScalarRangePackedUair, PrivateScalarRangeUair, Sha256CompressionSliceUair,
+        Sha256Ideal, ShaEcdsaUair, TestUairMixedDegrees, TestUairMixedShifts,
+        TestUairNoMultiplication, TestUairSimpleMultiplication,
         ecdsa::{
             EcdsaResultBindingError, EcdsaResultBranch, SECP256K1_N_UINT, decode_canonical_final_x,
             is_secp256k1_affine_point,
         },
         ecdsa_doubling::{SECP256K1_G_X_UINT, SECP256K1_G_Y_UINT},
+        private_ecdsa_scalars::{
+            AUX_Q1_START as PRIVATE_ECDSA_Q1_START,
+            IDENTITY_FINAL_ROW as PRIVATE_ECDSA_IDENTITY_ROW, LIMB_BITS as PRIVATE_ECDSA_LIMB_BITS,
+            build_private_ecdsa_scalar_trace, cols as private_ecdsa_cols,
+            derive_private_ecdsa_scalars, verify_private_ecdsa_public_polynomials,
+        },
+        private_scalar::{
+            build_private_scalar_range_packed_trace, build_private_scalar_range_trace,
+            cols as private_scalar_cols, packed_cols as private_scalar_packed_cols,
+        },
+        private_sha_ecdsa::{
+            PrivateShaEcdsaUair, build_private_signature_trace, cols as private_sha_ecdsa_cols,
+            verify_private_signature_application_binding,
+        },
         sha_ecdsa::{
             ShaEcdsaApplicationBindingError, ShaEcdsaScalarBindingError,
             build_trace_from_ecdsa_scalars, build_trace_from_message_and_signature,
@@ -807,6 +825,7 @@ mod tests {
             verify_sha_ecdsa_application_binding, verify_sha_ecdsa_h8_application_binding,
             verify_sha_ecdsa_result_binding,
         },
+        sha256,
     };
     use zinc_uair::{
         UairTrace,
@@ -1329,6 +1348,451 @@ mod tests {
             |_| {},
             |res| res.unwrap(),
         );
+    }
+
+    /// End-to-end proof for the maintained algebraic private-scalar range
+    /// construction. The two private bit columns use the protocol's native
+    /// Booleanity argument; shifted algebraic constraints bind the prefix
+    /// states.
+    #[test]
+    fn test_e2e_private_scalar_range() {
+        let num_vars = 9;
+        do_test::<TestZincTypesIprs, PrivateScalarRangeUair<ZtInt>>(
+            num_vars,
+            (
+                make_iprs(num_vars),
+                make_iprs(num_vars),
+                make_iprs(num_vars),
+            ),
+            |_ideal, _field_cfg| IdealOrZero::<DegreeOneIdeal<F>>::zero(),
+            |_| {},
+            |res| res.expect("verifier rejected canonical private scalars"),
+        );
+    }
+
+    /// End-to-end proof for the column-reduced three-state comparator.
+    #[test]
+    fn test_e2e_private_scalar_range_packed() {
+        let num_vars = 9;
+        do_test::<TestZincTypesIprs, PrivateScalarRangePackedUair<ZtInt>>(
+            num_vars,
+            (
+                make_iprs(num_vars),
+                make_iprs(num_vars),
+                make_iprs(num_vars),
+            ),
+            |_ideal, _field_cfg| IdealOrZero::<DegreeOneIdeal<F>>::zero(),
+            |_| {},
+            |res| res.expect("verifier rejected packed canonical private scalars"),
+        );
+    }
+
+    /// Deterministic byte receipt for the standalone comparator candidate.
+    /// Run with `iprs-rate-1-8` to match the frozen L3C rate/query profile.
+    #[test]
+    fn print_private_scalar_range_proof_bytes() {
+        let num_vars = 9;
+        let pp = setup_pp::<TestZincTypesIprs>(
+            num_vars,
+            (
+                make_iprs(num_vars),
+                make_iprs(num_vars),
+                make_iprs(num_vars),
+            ),
+        );
+        let trace = build_private_scalar_range_trace::<ZtInt>(
+            num_vars,
+            CbUint::ONE,
+            SECP256K1_N_UINT.wrapping_sub(&CbUint::ONE),
+        );
+        let public_trace = trace.public(&PrivateScalarRangeUair::<ZtInt>::signature());
+        let proof = ZincPlusPiop::<
+            TestZincTypesIprs,
+            PrivateScalarRangeUair<ZtInt>,
+            F,
+            DEGREE_PLUS_ONE,
+        >::prove::<false, CHECKED>(&pp, &trace, num_vars, project_scalar_fn)
+        .expect("private-scalar prover failed");
+        let component_bytes = proof.get_num_bytes();
+        let mut transcript = PcsProverTranscript::new_from_commitments(std::iter::empty());
+        transcript
+            .write(&proof)
+            .expect("proof serialization failed");
+        let serialized = transcript.stream.get_ref();
+        let zstd_bytes = zstd::encode_all(serialized.as_slice(), 3)
+            .expect("proof compression failed")
+            .len();
+        println!(
+            "PRIVATE_SCALAR_RANGE_PROOF serialized={} components={} zstd-3={}",
+            serialized.len(),
+            component_bytes,
+            zstd_bytes,
+        );
+
+        ZincPlusPiop::<
+            TestZincTypesIprs,
+            PrivateScalarRangeUair<ZtInt>,
+            F,
+            DEGREE_PLUS_ONE,
+        >::verify::<_, CHECKED>(
+            &pp,
+            proof,
+            &public_trace,
+            num_vars,
+            project_scalar_fn,
+            |_ideal, _field_cfg| IdealOrZero::<DegreeOneIdeal<F>>::zero(),
+        )
+        .expect("private-scalar verifier rejected byte-receipt proof");
+    }
+
+    /// Deterministic byte receipt for the packed comparator candidate.
+    #[test]
+    fn print_private_scalar_range_packed_proof_bytes() {
+        let num_vars = 9;
+        let pp = setup_pp::<TestZincTypesIprs>(
+            num_vars,
+            (
+                make_iprs(num_vars),
+                make_iprs(num_vars),
+                make_iprs(num_vars),
+            ),
+        );
+        let trace = build_private_scalar_range_packed_trace::<ZtInt>(
+            num_vars,
+            CbUint::ONE,
+            SECP256K1_N_UINT.wrapping_sub(&CbUint::ONE),
+        );
+        let public_trace = trace.public(&PrivateScalarRangePackedUair::<ZtInt>::signature());
+        let proof = ZincPlusPiop::<
+            TestZincTypesIprs,
+            PrivateScalarRangePackedUair<ZtInt>,
+            F,
+            DEGREE_PLUS_ONE,
+        >::prove::<false, CHECKED>(&pp, &trace, num_vars, project_scalar_fn)
+        .expect("packed private-scalar prover failed");
+        let component_bytes = proof.get_num_bytes();
+        let mut transcript = PcsProverTranscript::new_from_commitments(std::iter::empty());
+        transcript
+            .write(&proof)
+            .expect("proof serialization failed");
+        let serialized = transcript.stream.get_ref();
+        let zstd_bytes = zstd::encode_all(serialized.as_slice(), 3)
+            .expect("proof compression failed")
+            .len();
+        println!(
+            "PRIVATE_SCALAR_RANGE_PACKED_PROOF serialized={} components={} zstd-3={}",
+            serialized.len(),
+            component_bytes,
+            zstd_bytes,
+        );
+
+        ZincPlusPiop::<
+            TestZincTypesIprs,
+            PrivateScalarRangePackedUair<ZtInt>,
+            F,
+            DEGREE_PLUS_ONE,
+        >::verify::<_, CHECKED>(
+            &pp,
+            proof,
+            &public_trace,
+            num_vars,
+            project_scalar_fn,
+            |_ideal, _field_cfg| IdealOrZero::<DegreeOneIdeal<F>>::zero(),
+        )
+        .expect("packed private-scalar verifier rejected byte-receipt proof");
+    }
+
+    fn private_ecdsa_fixture() -> zinc_test_uair::PrivateEcdsaScalars {
+        derive_private_ecdsa_scalars(
+            CbUint::from_be_hex("E2D0FA68CFA8E68942FE9B038274B74A2F5E355D5C98CB9B6406E277B0F39188"),
+            CbUint::from_be_hex("5CD26EE278677AEBEC2C8E7486023D9299EF1B5705D3BE62531E98247E5E8302"),
+            CbUint::from_be_hex("7835018BB2CFF73325391068D670363C81AF019C87BC2CAC96672133C2B59568"),
+        )
+    }
+
+    /// Full prove/verify and deterministic byte receipt for the exact
+    /// base-2^26 private-scalar derivation candidate.
+    #[test]
+    fn test_e2e_private_ecdsa_scalars_and_print_bytes() {
+        let num_vars = 9;
+        let pp = setup_pp::<TestShaEcdsaZincTypes>(
+            num_vars,
+            (
+                make_iprs(num_vars),
+                make_iprs(num_vars),
+                make_iprs(num_vars),
+            ),
+        );
+        let witness = private_ecdsa_fixture();
+        let trace = build_private_ecdsa_scalar_trace::<ShaEcdsaInt>(num_vars, &witness);
+        let signature = PrivateEcdsaScalarsUair::<ShaEcdsaInt>::signature();
+        let public_trace = trace.public(&signature);
+        verify_private_ecdsa_public_polynomials(&public_trace, num_vars, &witness.e)
+            .expect("typed public polynomial contract rejected honest fixture");
+
+        let proof = ZincPlusPiop::<
+            TestShaEcdsaZincTypes,
+            PrivateEcdsaScalarsUair<ShaEcdsaInt>,
+            F,
+            DEGREE_PLUS_ONE,
+        >::prove::<false, CHECKED>(&pp, &trace, num_vars, project_scalar_fn)
+        .expect("private ECDSA scalar prover failed");
+        let component_bytes = proof.get_num_bytes();
+        let mut transcript = PcsProverTranscript::new_from_commitments(std::iter::empty());
+        transcript
+            .write(&proof)
+            .expect("proof serialization failed");
+        let serialized = transcript.stream.get_ref();
+        let zstd_bytes = zstd::encode_all(serialized.as_slice(), 3)
+            .expect("proof compression failed")
+            .len();
+        println!(
+            "PRIVATE_ECDSA_SCALARS_PROOF serialized={} components={} zstd-3={}",
+            serialized.len(),
+            component_bytes,
+            zstd_bytes,
+        );
+
+        ZincPlusPiop::<
+            TestShaEcdsaZincTypes,
+            PrivateEcdsaScalarsUair<ShaEcdsaInt>,
+            F,
+            DEGREE_PLUS_ONE,
+        >::verify::<_, CHECKED>(
+            &pp,
+            proof,
+            &public_trace,
+            num_vars,
+            project_scalar_fn,
+            default_project_ideal!(),
+        )
+        .expect("private ECDSA scalar verifier rejected honest proof");
+    }
+
+    #[test]
+    fn private_ecdsa_scalar_proof_rejects_adversarial_mutations() {
+        let num_vars = 9;
+        let pp = setup_pp::<TestShaEcdsaZincTypes>(
+            num_vars,
+            (
+                make_iprs(num_vars),
+                make_iprs(num_vars),
+                make_iprs(num_vars),
+            ),
+        );
+        let witness = private_ecdsa_fixture();
+        let signature = PrivateEcdsaScalarsUair::<ShaEcdsaInt>::signature();
+
+        let reject = |trace: &UairTrace<'static, ShaEcdsaInt, ShaEcdsaInt, DEGREE_PLUS_ONE>,
+                      case: &str| {
+            let public_trace = trace.public(&signature);
+            verify_private_ecdsa_public_polynomials(&public_trace, num_vars, &witness.e)
+                .unwrap_or_else(|error| panic!("{case}: public contract changed: {error}"));
+            let proof =
+                ZincPlusPiop::<
+                    TestShaEcdsaZincTypes,
+                    PrivateEcdsaScalarsUair<ShaEcdsaInt>,
+                    F,
+                    DEGREE_PLUS_ONE,
+                >::prove::<false, CHECKED>(&pp, trace, num_vars, project_scalar_fn);
+            if let Ok(proof) = proof {
+                let result = ZincPlusPiop::<
+                    TestShaEcdsaZincTypes,
+                    PrivateEcdsaScalarsUair<ShaEcdsaInt>,
+                    F,
+                    DEGREE_PLUS_ONE,
+                >::verify::<_, CHECKED>(
+                    &pp,
+                    proof,
+                    &public_trace,
+                    num_vars,
+                    project_scalar_fn,
+                    default_project_ideal!(),
+                );
+                assert!(
+                    result.is_err(),
+                    "invalid private ECDSA trace was accepted: {case}"
+                );
+            }
+        };
+
+        let mut non_boolean = build_private_ecdsa_scalar_trace::<ShaEcdsaInt>(num_vars, &witness);
+        non_boolean.int.to_mut()[private_ecdsa_cols::W_R_BIT].evaluations[128] =
+            ShaEcdsaInt::from(2);
+        reject(&non_boolean, "r bit=2");
+
+        let mut bad_comparator =
+            build_private_ecdsa_scalar_trace::<ShaEcdsaInt>(num_vars, &witness);
+        bad_comparator.int.to_mut()[private_ecdsa_cols::W_S_LESS].evaluations[128] +=
+            ShaEcdsaInt::from(1);
+        reject(&bad_comparator, "s comparator-state mutation");
+
+        let mut quotient_overflow =
+            build_private_ecdsa_scalar_trace::<ShaEcdsaInt>(num_vars, &witness);
+        let overflow = 1_u32 << PRIVATE_ECDSA_LIMB_BITS;
+        quotient_overflow.int.to_mut()[private_ecdsa_cols::W_AUX].evaluations
+            [PRIVATE_ECDSA_Q1_START] = ShaEcdsaInt::from(overflow);
+        quotient_overflow.binary_poly.to_mut()[private_ecdsa_cols::B_AUX].evaluations
+            [PRIVATE_ECDSA_Q1_START] = BinaryPoly::from(overflow);
+        reject(&quotient_overflow, "2^26 quotient limb");
+
+        let mut bad_identity = build_private_ecdsa_scalar_trace::<ShaEcdsaInt>(num_vars, &witness);
+        bad_identity.arbitrary_poly.to_mut()[private_ecdsa_cols::W_Q1].evaluations
+            [PRIVATE_ECDSA_IDENTITY_ROW]
+            .coeffs[0] += ShaEcdsaInt::from(1);
+        reject(&bad_identity, "q1 identity accumulator mutation");
+
+        let mut opposite_lanes =
+            build_private_ecdsa_scalar_trace::<ShaEcdsaInt>(num_vars, &witness);
+        opposite_lanes.int.to_mut()[private_ecdsa_cols::W_R_LESS].evaluations[128] +=
+            ShaEcdsaInt::from(1);
+        opposite_lanes.int.to_mut()[private_ecdsa_cols::W_S_LESS].evaluations[128] -=
+            ShaEcdsaInt::from(1);
+        reject(&opposite_lanes, "opposite comparator-lane mutations");
+    }
+
+    fn private_scalar_proof_is_rejected(
+        trace: &UairTrace<'static, ZtInt, ZtInt, DEGREE_PLUS_ONE>,
+        num_vars: usize,
+        case: &str,
+    ) {
+        let pp = setup_pp::<TestZincTypesIprs>(
+            num_vars,
+            (
+                make_iprs(num_vars),
+                make_iprs(num_vars),
+                make_iprs(num_vars),
+            ),
+        );
+        let public_trace = trace.public(&PrivateScalarRangeUair::<ZtInt>::signature());
+        let proof = ZincPlusPiop::<
+            TestZincTypesIprs,
+            PrivateScalarRangeUair<ZtInt>,
+            F,
+            DEGREE_PLUS_ONE,
+        >::prove::<false, CHECKED>(&pp, trace, num_vars, project_scalar_fn);
+
+        if let Ok(proof) = proof {
+            let result = ZincPlusPiop::<
+                TestZincTypesIprs,
+                PrivateScalarRangeUair<ZtInt>,
+                F,
+                DEGREE_PLUS_ONE,
+            >::verify::<_, CHECKED>(
+                &pp,
+                proof,
+                &public_trace,
+                num_vars,
+                project_scalar_fn,
+                |_ideal, _field_cfg| IdealOrZero::<DegreeOneIdeal<F>>::zero(),
+            );
+            assert!(
+                result.is_err(),
+                "invalid private-scalar trace was accepted: {case}"
+            );
+        }
+    }
+
+    fn private_scalar_packed_proof_is_rejected(
+        trace: &UairTrace<'static, ZtInt, ZtInt, DEGREE_PLUS_ONE>,
+        num_vars: usize,
+        case: &str,
+    ) {
+        let pp = setup_pp::<TestZincTypesIprs>(
+            num_vars,
+            (
+                make_iprs(num_vars),
+                make_iprs(num_vars),
+                make_iprs(num_vars),
+            ),
+        );
+        let public_trace = trace.public(&PrivateScalarRangePackedUair::<ZtInt>::signature());
+        let proof = ZincPlusPiop::<
+            TestZincTypesIprs,
+            PrivateScalarRangePackedUair<ZtInt>,
+            F,
+            DEGREE_PLUS_ONE,
+        >::prove::<false, CHECKED>(&pp, trace, num_vars, project_scalar_fn);
+
+        if let Ok(proof) = proof {
+            let result = ZincPlusPiop::<
+                TestZincTypesIprs,
+                PrivateScalarRangePackedUair<ZtInt>,
+                F,
+                DEGREE_PLUS_ONE,
+            >::verify::<_, CHECKED>(
+                &pp,
+                proof,
+                &public_trace,
+                num_vars,
+                project_scalar_fn,
+                |_ideal, _field_cfg| IdealOrZero::<DegreeOneIdeal<F>>::zero(),
+            );
+            assert!(
+                result.is_err(),
+                "invalid packed private-scalar trace was accepted: {case}"
+            );
+        }
+    }
+
+    #[test]
+    fn private_scalar_range_rejects_boundaries_and_mutations() {
+        let num_vars = 9;
+        let one = CbUint::<EC_FP_INT_LIMBS>::ONE;
+        let max = CbUint::<EC_FP_INT_LIMBS>::MAX;
+
+        for (case, r, s) in [
+            ("r=0", CbUint::ZERO, one),
+            ("s=0", one, CbUint::ZERO),
+            ("r=n", SECP256K1_N_UINT, one),
+            ("s=n", one, SECP256K1_N_UINT),
+            ("r=2^256-1", max, one),
+        ] {
+            let trace = build_private_scalar_range_trace::<ZtInt>(num_vars, r, s);
+            private_scalar_proof_is_rejected(&trace, num_vars, case);
+        }
+
+        let mut non_boolean = build_private_scalar_range_trace::<ZtInt>(num_vars, one, one);
+        non_boolean.int.to_mut()[private_scalar_cols::W_R_BIT].evaluations[255] = 2;
+        private_scalar_proof_is_rejected(&non_boolean, num_vars, "r bit=2");
+
+        let mut bad_less = build_private_scalar_range_trace::<ZtInt>(num_vars, one, one);
+        bad_less.int.to_mut()[private_scalar_cols::W_R_LESS].evaluations[128] ^= 1;
+        private_scalar_proof_is_rejected(&bad_less, num_vars, "r less-state mutation");
+
+        let mut bad_seen = build_private_scalar_range_trace::<ZtInt>(num_vars, one, one);
+        bad_seen.int.to_mut()[private_scalar_cols::W_S_SEEN].evaluations[255] ^= 1;
+        private_scalar_proof_is_rejected(&bad_seen, num_vars, "s seen-state mutation");
+    }
+
+    #[test]
+    fn private_scalar_range_packed_rejects_boundaries_and_mutations() {
+        let num_vars = 9;
+        let one = CbUint::<EC_FP_INT_LIMBS>::ONE;
+        let max = CbUint::<EC_FP_INT_LIMBS>::MAX;
+
+        for (case, r, s) in [
+            ("r=0", CbUint::ZERO, one),
+            ("s=0", one, CbUint::ZERO),
+            ("r=n", SECP256K1_N_UINT, one),
+            ("s=n", one, SECP256K1_N_UINT),
+            ("r=2^256-1", max, one),
+        ] {
+            let trace = build_private_scalar_range_packed_trace::<ZtInt>(num_vars, r, s);
+            private_scalar_packed_proof_is_rejected(&trace, num_vars, case);
+        }
+
+        let mut non_boolean = build_private_scalar_range_packed_trace::<ZtInt>(num_vars, one, one);
+        non_boolean.int.to_mut()[private_scalar_packed_cols::W_R_BIT].evaluations[255] = 2;
+        private_scalar_packed_proof_is_rejected(&non_boolean, num_vars, "r bit=2");
+
+        let mut bad_state = build_private_scalar_range_packed_trace::<ZtInt>(num_vars, one, one);
+        bad_state.int.to_mut()[private_scalar_packed_cols::W_R_STATE].evaluations[128] ^= 1;
+        private_scalar_packed_proof_is_rejected(&bad_state, num_vars, "r state mutation");
+
+        let mut bad_final = build_private_scalar_range_packed_trace::<ZtInt>(num_vars, one, one);
+        bad_final.int.to_mut()[private_scalar_packed_cols::W_S_STATE].evaluations[256] = 1;
+        private_scalar_packed_proof_is_rejected(&bad_final, num_vars, "s final state mutation");
     }
 
     /// End-to-end test: BigLinearUair.
@@ -2071,8 +2535,11 @@ mod tests {
             serialized_len,
             serialized_len.div_ceil(1024),
         );
+        // The H9 soundness repair stores the RCB T4 cross term consumed by
+        // the UAIR instead of the raw product. That changes the deterministic
+        // transcript by 96 bytes without changing the declared proof shape.
         assert_eq!(
-            serialized_len, 647_518,
+            serialized_len, 647_422,
             "fixed-seed folded-4x proof fixture changed",
         );
         let mut transcript = transcript.into_verification_transcript();
@@ -2186,8 +2653,10 @@ mod tests {
 
         let total_proof_bytes = proof.get_num_bytes();
         println!("total proof bytes: {total_proof_bytes}");
+        // See the folded fixture above: the repaired T4 witness changes the
+        // deterministic transcript, so the pre-H9 H8 receipt is superseded.
         assert_eq!(
-            total_proof_bytes, 845_098,
+            total_proof_bytes, 845_002,
             "fixed-seed flat proof fixture changed",
         );
 
@@ -2630,12 +3099,8 @@ mod tests {
             "7835018BB2CFF73325391068D670363C81AF019C87BC2CAC96672133C2B59568",
         ));
         let q = (
-            CbUint::from_be_hex(
-                "C6047F9441ED7D6D3045406E95C07CD85C778E4B8CEF3CA7ABAC09B95C709EE5",
-            ),
-            CbUint::from_be_hex(
-                "1AE168FEA63DC339A3C58419466CEAEEF7F632653266D0E1236431A950CFE52A",
-            ),
+            CbUint::from_be_hex("C6047F9441ED7D6D3045406E95C07CD85C778E4B8CEF3CA7ABAC09B95C709EE5"),
+            CbUint::from_be_hex("1AE168FEA63DC339A3C58419466CEAEEF7F632653266D0E1236431A950CFE52A"),
         );
         let q_x = uint_to_be_bytes(&q.0);
         let q_y = uint_to_be_bytes(&q.1);
@@ -2745,13 +3210,14 @@ mod tests {
         let changed_digest_bytes =
             extract_sha256_output(&changed_digest).expect("mutated output must remain readable");
         assert_ne!(changed_digest_bytes, binding.scalars.digest);
-        let changed_scalars = derive_ecdsa_verification_scalars(
-            changed_digest_bytes,
-            &signature_r,
-            &signature_s,
-        )
-        .expect("frozen signature remains canonically encoded");
-        set_h8_scalar_selectors(&mut changed_digest, &changed_scalars.u1, &changed_scalars.u2);
+        let changed_scalars =
+            derive_ecdsa_verification_scalars(changed_digest_bytes, &signature_r, &signature_s)
+                .expect("frozen signature remains canonically encoded");
+        set_h8_scalar_selectors(
+            &mut changed_digest,
+            &changed_scalars.u1,
+            &changed_scalars.u2,
+        );
         verify_sha_ecdsa_h8_application_binding(
             &message,
             &signature_r,
@@ -2781,9 +3247,8 @@ mod tests {
         let mut changed_chain_copy = public_trace.clone();
         let input_row = sha256::cols::ROWS_PER_COMP;
         let junction_row = input_row + sha256::cols::ROUNDS_PER_COMP;
-        let original_input = changed_chain_copy.binary_poly[sha_ecdsa_cols::PA_A].evaluations
-            [input_row]
-            .clone();
+        let original_input =
+            changed_chain_copy.binary_poly[sha_ecdsa_cols::PA_A].evaluations[input_row].clone();
         let original_junction =
             changed_chain_copy.binary_poly[sha_ecdsa_cols::PA_A].evaluations[junction_row].clone();
         assert_eq!(original_input, original_junction);
@@ -2866,20 +3331,15 @@ mod tests {
         // the alternate public trace.
         let mut other_message = message.clone();
         *other_message.last_mut().expect("H8 message is nonempty") ^= 1;
-        let other_sha = sha256::build_trace_from_message::<ShaEcdsaInt>(
-            SHA_ECDSA_NUM_VARS,
-            &other_message,
-        )
-        .expect("alternate 400-byte message must build");
+        let other_sha =
+            sha256::build_trace_from_message::<ShaEcdsaInt>(SHA_ECDSA_NUM_VARS, &other_message)
+                .expect("alternate 400-byte message must build");
         let other_sha_public =
             other_sha.public(&<Sha256CompressionSliceUair<ShaEcdsaInt> as Uair>::signature());
         let other_digest =
             extract_sha256_output(&other_sha_public).expect("alternate digest must exist");
         let other_r_value = SECP256K1_G_X_UINT;
-        let other_s_value = add_mod_order(
-            &CbUint::from_be_slice(&other_digest),
-            &other_r_value,
-        );
+        let other_s_value = add_mod_order(&CbUint::from_be_slice(&other_digest), &other_r_value);
         let other_r = uint_to_be_bytes(&other_r_value);
         let other_s = uint_to_be_bytes(&other_s_value);
         let other_trace = build_trace_from_message_and_signature::<ShaEcdsaInt>(
@@ -2927,6 +3387,217 @@ mod tests {
             )
             .is_err(),
             "a proof must not transfer between two valid H8 statements",
+        );
+    }
+
+    #[test]
+    fn test_e2e_private_signature_statement_and_print_bytes() {
+        type Zt = TestShaEcdsaZincTypes;
+        type U = PrivateShaEcdsaUair<ShaEcdsaInt>;
+
+        let message = h8_message();
+        let signature_r = uint_to_be_bytes(&CbUint::from_be_hex(
+            "5CD26EE278677AEBEC2C8E7486023D9299EF1B5705D3BE62531E98247E5E8302",
+        ));
+        let signature_s = uint_to_be_bytes(&CbUint::from_be_hex(
+            "7835018BB2CFF73325391068D670363C81AF019C87BC2CAC96672133C2B59568",
+        ));
+        let q = (
+            CbUint::from_be_hex("C6047F9441ED7D6D3045406E95C07CD85C778E4B8CEF3CA7ABAC09B95C709EE5"),
+            CbUint::from_be_hex("1AE168FEA63DC339A3C58419466CEAEEF7F632653266D0E1236431A950CFE52A"),
+        );
+        let q_x = uint_to_be_bytes(&q.0);
+        let q_y = uint_to_be_bytes(&q.1);
+        let trace = build_private_signature_trace(
+            SHA_ECDSA_NUM_VARS,
+            &message,
+            q,
+            &signature_r,
+            &signature_s,
+        )
+        .expect("private-signature H8 statement must build");
+        let signature = U::signature();
+        let public_trace = trace.public(&signature);
+        verify_private_signature_application_binding(&message, &q_x, &q_y, &public_trace)
+            .expect("typed private-signature statement binding rejected the fixture");
+
+        let pp = setup_pp::<Zt>(
+            SHA_ECDSA_NUM_VARS,
+            (
+                make_iprs(SHA_ECDSA_NUM_VARS),
+                make_iprs(SHA_ECDSA_NUM_VARS),
+                make_iprs(SHA_ECDSA_NUM_VARS),
+            ),
+        );
+        let prove_started = std::time::Instant::now();
+        let proof = ZincPlusPiop::<Zt, U, F, DEGREE_PLUS_ONE>::prove::<false, CHECKED>(
+            &pp,
+            &trace,
+            SHA_ECDSA_NUM_VARS,
+            project_scalar_fn,
+        )
+        .expect("private-signature prover failed");
+        let prove_ns = prove_started.elapsed().as_nanos();
+        let component_bytes = proof.get_num_bytes();
+        let mut transcript = PcsProverTranscript::new_from_commitments(std::iter::empty());
+        transcript
+            .write(&proof)
+            .expect("private-signature proof must serialize");
+        let serialized = transcript.stream.get_ref();
+        let zstd_bytes = zstd::encode_all(serialized.as_slice(), 3)
+            .expect("private-signature proof compression failed")
+            .len();
+        println!(
+            "PRIVATE_SIGNATURE_H8_PROOF serialized={} components={} zstd-3={}",
+            serialized.len(),
+            component_bytes,
+            zstd_bytes,
+        );
+        assert_eq!(
+            serialized.len(),
+            component_bytes + core::mem::size_of::<u32>()
+        );
+
+        let verify_started = std::time::Instant::now();
+        ZincPlusPiop::<Zt, U, F, DEGREE_PLUS_ONE>::verify::<_, CHECKED>(
+            &pp,
+            proof,
+            &public_trace,
+            SHA_ECDSA_NUM_VARS,
+            project_scalar_fn,
+            sha256_test_project_ideal,
+        )
+        .expect("private-signature verifier rejected the fixture");
+        let verify_ns = verify_started.elapsed().as_nanos();
+        println!(
+            "PRIVATE_SIGNATURE_H8_TIMING rep={} queries={} prove_ns={} verify_ns={}",
+            REP, NUM_COL_OPENINGS_FOR_REP, prove_ns, verify_ns,
+        );
+    }
+
+    #[test]
+    fn private_signature_proof_rejects_result_branch_mutation() {
+        type Zt = TestShaEcdsaZincTypes;
+        type U = PrivateShaEcdsaUair<ShaEcdsaInt>;
+
+        let message = h8_message();
+        let signature_r = uint_to_be_bytes(&CbUint::from_be_hex(
+            "5CD26EE278677AEBEC2C8E7486023D9299EF1B5705D3BE62531E98247E5E8302",
+        ));
+        let signature_s = uint_to_be_bytes(&CbUint::from_be_hex(
+            "7835018BB2CFF73325391068D670363C81AF019C87BC2CAC96672133C2B59568",
+        ));
+        let q = (
+            CbUint::from_be_hex("C6047F9441ED7D6D3045406E95C07CD85C778E4B8CEF3CA7ABAC09B95C709EE5"),
+            CbUint::from_be_hex("1AE168FEA63DC339A3C58419466CEAEEF7F632653266D0E1236431A950CFE52A"),
+        );
+        let q_x = uint_to_be_bytes(&q.0);
+        let q_y = uint_to_be_bytes(&q.1);
+        let mut trace = build_private_signature_trace(
+            SHA_ECDSA_NUM_VARS,
+            &message,
+            q,
+            &signature_r,
+            &signature_s,
+        )
+        .expect("private-signature fixture must build");
+        trace.int.to_mut()[private_sha_ecdsa_cols::W_RESULT_BRANCH].evaluations
+            [zinc_test_uair::ecdsa::FINAL_ROW] += ShaEcdsaInt::from(1_u32);
+
+        let public_trace = trace.public(&U::signature());
+        verify_private_signature_application_binding(&message, &q_x, &q_y, &public_trace)
+            .expect("a witness-only mutation must leave the typed public contract unchanged");
+        let pp = setup_pp::<Zt>(
+            SHA_ECDSA_NUM_VARS,
+            (
+                make_iprs(SHA_ECDSA_NUM_VARS),
+                make_iprs(SHA_ECDSA_NUM_VARS),
+                make_iprs(SHA_ECDSA_NUM_VARS),
+            ),
+        );
+        let proof = ZincPlusPiop::<Zt, U, F, DEGREE_PLUS_ONE>::prove::<false, CHECKED>(
+            &pp,
+            &trace,
+            SHA_ECDSA_NUM_VARS,
+            project_scalar_fn,
+        )
+        .expect("the adversarial trace must reach verifier-side constraint checking");
+        assert!(
+            ZincPlusPiop::<Zt, U, F, DEGREE_PLUS_ONE>::verify::<_, CHECKED>(
+                &pp,
+                proof,
+                &public_trace,
+                SHA_ECDSA_NUM_VARS,
+                project_scalar_fn,
+                sha256_test_project_ideal,
+            )
+            .is_err(),
+            "the proof accepted a mutated private result branch",
+        );
+    }
+
+    #[test]
+    fn private_signature_proof_rejects_scalar_group_junction_mutation() {
+        type Zt = TestShaEcdsaZincTypes;
+        type U = PrivateShaEcdsaUair<ShaEcdsaInt>;
+
+        let message = h8_message();
+        let signature_r = uint_to_be_bytes(&CbUint::from_be_hex(
+            "5CD26EE278677AEBEC2C8E7486023D9299EF1B5705D3BE62531E98247E5E8302",
+        ));
+        let signature_s = uint_to_be_bytes(&CbUint::from_be_hex(
+            "7835018BB2CFF73325391068D670363C81AF019C87BC2CAC96672133C2B59568",
+        ));
+        let q = (
+            CbUint::from_be_hex("C6047F9441ED7D6D3045406E95C07CD85C778E4B8CEF3CA7ABAC09B95C709EE5"),
+            CbUint::from_be_hex("1AE168FEA63DC339A3C58419466CEAEEF7F632653266D0E1236431A950CFE52A"),
+        );
+        let q_x = uint_to_be_bytes(&q.0);
+        let q_y = uint_to_be_bytes(&q.1);
+        let mut trace = build_private_signature_trace(
+            SHA_ECDSA_NUM_VARS,
+            &message,
+            q,
+            &signature_r,
+            &signature_s,
+        )
+        .expect("private-signature fixture must build");
+
+        // The same witness column is consumed as the private u1 bit stream by
+        // the scalar identity and as B1 by the Shamir group trace. Mutating it
+        // exercises the cross-component junction rather than either typed
+        // public boundary.
+        trace.int.to_mut()[sha_ecdsa_cols::ECDSA_PA_B1].evaluations[17] += ShaEcdsaInt::from(1_u32);
+
+        let public_trace = trace.public(&U::signature());
+        verify_private_signature_application_binding(&message, &q_x, &q_y, &public_trace)
+            .expect("a witness-only junction mutation must leave the public contract unchanged");
+        let pp = setup_pp::<Zt>(
+            SHA_ECDSA_NUM_VARS,
+            (
+                make_iprs(SHA_ECDSA_NUM_VARS),
+                make_iprs(SHA_ECDSA_NUM_VARS),
+                make_iprs(SHA_ECDSA_NUM_VARS),
+            ),
+        );
+        let proof = ZincPlusPiop::<Zt, U, F, DEGREE_PLUS_ONE>::prove::<false, CHECKED>(
+            &pp,
+            &trace,
+            SHA_ECDSA_NUM_VARS,
+            project_scalar_fn,
+        )
+        .expect("the adversarial trace must reach verifier-side constraint checking");
+        assert!(
+            ZincPlusPiop::<Zt, U, F, DEGREE_PLUS_ONE>::verify::<_, CHECKED>(
+                &pp,
+                proof,
+                &public_trace,
+                SHA_ECDSA_NUM_VARS,
+                project_scalar_fn,
+                sha256_test_project_ideal,
+            )
+            .is_err(),
+            "the proof accepted a mutated private scalar/group junction",
         );
     }
 

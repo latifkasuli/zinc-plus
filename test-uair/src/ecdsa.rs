@@ -868,8 +868,11 @@ fn rcb_add(
     let y = add_mod_p(&mul_mod_p(&x_base, &z_base), &mul_mod_p(&three_t0, &b3_t4));
     let z = add_mod_p(&mul_mod_p(&t5, &z_base), &mul_mod_p(&t3, &three_t0));
 
+    // Only T4 is materialized by the UAIR. T3 and T5 are reconstructed from
+    // their raw products in-circuit, while T4 must contain the cross term
+    // after subtracting T0 and T2.
     (
-        [t0, t1, t2, t3_raw, t4_raw, t5_raw],
+        [t0, t1, t2, t3_raw, t4, t5_raw],
         ProjectivePoint { x, y, z },
     )
 }
@@ -1230,6 +1233,20 @@ mod tests {
                 z: read_uint(&trace, cols::S_ADD, row),
             };
             let expected = compute_step(&state, &addend);
+            let (_, doubled) = rcb_double(&state);
+            let raw_t4 = mul_mod_p(
+                &add_mod_p(&doubled.x, &doubled.z),
+                &add_mod_p(&addend.x, &addend.z),
+            );
+            let expected_t4 = sub_mod_p(
+                &sub_mod_p(&raw_t4, &expected.addition_products[0]),
+                &expected.addition_products[2],
+            );
+            assert_eq!(
+                read_uint(&trace, cols::W_A_T4, row),
+                expected_t4,
+                "materialized RCB T4 cross term at row {row}",
+            );
             for (column, value) in [
                 (cols::W_D_T0, expected.doubled_products[0]),
                 (cols::W_D_T1, expected.doubled_products[1]),

@@ -7,7 +7,9 @@
 //! typically passed to `mbs` / `from_ref` many times by reference to a
 //! local. Hashing the full scalar key to look up the projected value is
 //! expensive (~1 µs for a 1.3 KB `DensePolynomial<_, 32>` key), and pointer
-//! identity is a cheap proxy that catches the common case.
+//! identity is a cheap first filter that catches the common case. Pointer
+//! identity alone is not a valid key: sequential temporaries may reuse the
+//! same stack slot, so a hit must also compare the scalar value.
 //!
 //! [`ScalarProjCache`] is stack-allocated with a small fixed capacity so it
 //! costs ~nothing for UAIRs with 0–1 `mbs` sites, and amortizes the HashMap
@@ -29,16 +31,16 @@ pub const SCALAR_PROJ_CACHE_CAP: usize = 8;
 
 pub struct ScalarProjCache<S, V> {
     ptrs: [*const S; SCALAR_PROJ_CACHE_CAP],
-    vals: [MaybeUninit<V>; SCALAR_PROJ_CACHE_CAP],
+    entries: [MaybeUninit<(S, V)>; SCALAR_PROJ_CACHE_CAP],
     len: usize,
 }
 
-impl<S, V: Clone> ScalarProjCache<S, V> {
+impl<S: Clone + PartialEq, V: Clone> ScalarProjCache<S, V> {
     pub fn new() -> Self {
         Self {
             ptrs: [std::ptr::null(); SCALAR_PROJ_CACHE_CAP],
             // MaybeUninit::uninit() is const-eval'd and produces no stores.
-            vals: [const { MaybeUninit::uninit() }; SCALAR_PROJ_CACHE_CAP],
+            entries: [const { MaybeUninit::uninit() }; SCALAR_PROJ_CACHE_CAP],
             len: 0,
         }
     }
@@ -47,10 +49,13 @@ impl<S, V: Clone> ScalarProjCache<S, V> {
         let ptr = scalar as *const S;
         for i in 0..self.len {
             if self.ptrs[i] == ptr {
-                // SAFETY: vals[i] is initialized because i < self.len; the
+                // SAFETY: entries[i] is initialized because i < self.len; the
                 // only way to grow `len` is via `push`, which writes before
                 // incrementing.
-                return Some(unsafe { self.vals[i].assume_init_ref() }.clone());
+                let (cached_scalar, cached_value) = unsafe { self.entries[i].assume_init_ref() };
+                if cached_scalar == scalar {
+                    return Some(cached_value.clone());
+                }
             }
         }
         None
@@ -60,7 +65,7 @@ impl<S, V: Clone> ScalarProjCache<S, V> {
     pub fn push(&mut self, scalar: &S, value: V) {
         if self.len < SCALAR_PROJ_CACHE_CAP {
             self.ptrs[self.len] = scalar as *const S;
-            self.vals[self.len].write(value);
+            self.entries[self.len].write((scalar.clone(), value));
             self.len += 1;
         }
         // Silently drop if full: correctness is preserved (HashMap fallback
@@ -68,7 +73,7 @@ impl<S, V: Clone> ScalarProjCache<S, V> {
     }
 }
 
-impl<S, V: Clone> Default for ScalarProjCache<S, V> {
+impl<S: Clone + PartialEq, V: Clone> Default for ScalarProjCache<S, V> {
     fn default() -> Self {
         Self::new()
     }
@@ -76,13 +81,33 @@ impl<S, V: Clone> Default for ScalarProjCache<S, V> {
 
 impl<S, V> Drop for ScalarProjCache<S, V> {
     fn drop(&mut self) {
-        // SAFETY: vals[0..self.len] are the slots written by `push`, so
+        // SAFETY: entries[0..self.len] are the slots written by `push`, so
         // they are the initialized prefix. The tail (len..CAP) is still
         // uninitialized and must not be dropped.
         for i in 0..self.len {
             unsafe {
-                self.vals[i].assume_init_drop();
+                self.entries[i].assume_init_drop();
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ScalarProjCache;
+
+    #[test]
+    fn reused_pointer_requires_equal_scalar_value() {
+        let mut cache = ScalarProjCache::new();
+        let mut scalar = 1_u64;
+        cache.push(&scalar, 11_u64);
+        assert_eq!(cache.get(&scalar), Some(11));
+
+        // The address is unchanged, but the old projection must not be used
+        // for the new scalar occupying that slot.
+        scalar = 2;
+        assert_eq!(cache.get(&scalar), None);
+        cache.push(&scalar, 22);
+        assert_eq!(cache.get(&scalar), Some(22));
     }
 }

@@ -4,6 +4,9 @@ pub mod ecdsa_addition;
 pub mod ecdsa_affine;
 pub mod ecdsa_doubling;
 mod generate_trace;
+pub mod private_ecdsa_scalars;
+pub mod private_scalar;
+pub mod private_sha_ecdsa;
 pub mod sha256;
 pub mod sha_ecdsa;
 
@@ -12,6 +15,11 @@ pub use ecdsa_addition::JacobianAdditionUair;
 pub use ecdsa_affine::AffineConversionUair;
 pub use ecdsa_doubling::{EC_FP_INT_LIMBS, EcdsaFpRing, JacobianDoublingUair};
 pub use generate_trace::*;
+pub use private_ecdsa_scalars::{
+    PrivateEcdsaScalars, PrivateEcdsaScalarsUair, build_private_ecdsa_scalar_trace,
+    derive_private_ecdsa_scalars, verify_private_ecdsa_public_polynomials,
+};
+pub use private_scalar::{PrivateScalarRangePackedUair, PrivateScalarRangeUair};
 pub use sha256::{Sha256CompressionSliceUair, Sha256Ideal};
 pub use sha_ecdsa::ShaEcdsaUair;
 
